@@ -1,0 +1,16 @@
+# clones, worktrees, isolated maven/gradle homes — reproducible, not committed
+repos/
+tmp/
+m2/
+.gradle/
+examples/
+
+# runs/: whitelist — harness scripts + noise allowlist + headline evidence manifests
+runs/*
+!runs/*.sh
+!runs/manifest.py
+!runs/noise-files-v2.txt
+!runs/recon-synthesis.md
+!runs/ref.manifest
+!runs/hermetic-v4.manifest
+!runs/classpath.core-coldpack.txt

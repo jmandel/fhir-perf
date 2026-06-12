@@ -1,0 +1,41 @@
+def localMavenRepo = System.getProperty("fhirPerf.mavenLocal")
+if (!localMavenRepo) {
+  throw new GradleException("Missing -DfhirPerf.mavenLocal=/path/to/m2/repository")
+}
+
+def coreVersion = System.getProperty("fhirPerf.coreVersion")
+def coreArtifacts = [
+  "org.hl7.fhir.core",
+  "org.hl7.fhir.utilities",
+  "org.hl7.fhir.dstu2",
+  "org.hl7.fhir.dstu2016may",
+  "org.hl7.fhir.dstu3",
+  "org.hl7.fhir.dstu3.support",
+  "org.hl7.fhir.r4",
+  "org.hl7.fhir.r4b",
+  "org.hl7.fhir.r5",
+  "org.hl7.fhir.convertors",
+  "org.hl7.fhir.validation",
+  "org.hl7.fhir.model",
+  "org.hl7.fhir.support"
+] as Set
+
+allprojects {
+  repositories.matching { it.name == "MavenLocal" }.all { repo ->
+    repo.url = uri(localMavenRepo)
+  }
+
+  configurations.configureEach {
+    resolutionStrategy.cacheChangingModulesFor 0, "seconds"
+    resolutionStrategy.cacheDynamicVersionsFor 0, "seconds"
+    resolutionStrategy.eachDependency { details ->
+      if (coreVersion &&
+          details.requested.group == "ca.uhn.hapi.fhir" &&
+          coreArtifacts.contains(details.requested.name)) {
+        details.useVersion(coreVersion)
+        details.because("FHIR perf gym resolves fhir-core artifacts from the local gym Maven repo")
+      }
+    }
+  }
+}
+

@@ -1,0 +1,526 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+
+FHIR_CORE="${FHIR_CORE:-$ROOT/repos/fhir-core}"
+KINDLING="${KINDLING:-$ROOT/repos/kindling}"
+IG_PUBLISHER="${IG_PUBLISHER:-$ROOT/repos/ig-publisher}"
+FHIR_SPEC="${FHIR_SPEC:-$HOME/work/fhir}"
+M2_REPO="${FHIR_PERF_M2_REPO:-$ROOT/m2/repository}"
+GRADLE_HOME="${FHIR_PERF_GRADLE_USER_HOME:-$ROOT/.gradle}"
+MAVEN="${FHIR_PERF_MAVEN:-$FHIR_CORE/mvnw}"
+GRADLE_INIT="$ROOT/gradle/local-maven.init.gradle"
+
+CORE_URL="https://github.com/hapifhir/org.hl7.fhir.core.git"
+KINDLING_URL="https://github.com/HL7/kindling.git"
+PUBLISHER_URL="https://github.com/HL7/fhir-ig-publisher.git"
+
+die() {
+  printf 'error: %s\n' "$*" >&2
+  exit 1
+}
+
+usage() {
+  cat <<'USAGE'
+FHIR perf gym
+
+Usage:
+  bin/gym clone
+  bin/gym status
+  bin/gym doctor
+  bin/gym build-core [--with-tests] [extra Maven args...]
+  bin/gym build-core-ref <git-ref> [--with-tests] [extra Maven args...]
+  bin/gym build-kindling [--local-core|--core-version VERSION] [--with-tests] [extra Maven args...]
+  bin/gym build-publisher [--local-core|--core-version VERSION] [--with-tests] [extra Maven args...]
+  bin/gym build-all [--local-core|--core-version VERSION] [--with-tests]
+  bin/gym align-poms
+  bin/gym local-artifacts
+  bin/gym publisher-jar
+  bin/gym publisher-run [publisher args...]
+  bin/gym spec-deps [--local-core|--core-version VERSION]
+  bin/gym spec-print [--local-core|--core-version VERSION]
+  bin/gym spec-publish [--local-core|--core-version VERSION] [-- publisher args...]
+  bin/gym mvn <maven args...>
+  bin/gym spec-gradle <gradle args...>
+
+Defaults:
+  Maven local repo: ./m2/repository
+  Gradle user home: ./.gradle
+  FHIR spec checkout: ~/work/fhir
+
+By default, downstream builds honor the dependency versions declared by their
+own POM/Gradle files. Add --local-core to force the current repos/fhir-core
+version into Kindling, IG Publisher, or the spec Gradle build.
+
+Set FHIR_SPEC, FHIR_PERF_M2_REPO, or FHIR_PERF_GRADLE_USER_HOME to override.
+USAGE
+}
+
+require_file() {
+  [[ -f "$1" ]] || die "missing required file: $1"
+}
+
+require_dir() {
+  [[ -d "$1" ]] || die "missing required directory: $1"
+}
+
+project_version() {
+  local pom="$1/pom.xml"
+  require_file "$pom"
+  perl -0ne 's{<parent>.*?</parent>}{}s; if (m{<version>\s*([^<]+)\s*</version>}) { print "$1\n"; exit }' "$pom"
+}
+
+pom_property() {
+  local pom="$1/pom.xml"
+  local prop="$2"
+  require_file "$pom"
+  PROP="$prop" perl -0ne 'BEGIN { $p = $ENV{"PROP"} } if (m{<\Q$p\E>\s*([^<]+)\s*</\Q$p\E>}) { print "$1\n"; exit }' "$pom"
+}
+
+set_pom_property() {
+  local pom="$1"
+  local prop="$2"
+  local value="$3"
+  require_file "$pom"
+  PROP="$prop" VALUE="$value" perl -0pi -e '
+    BEGIN { $p = $ENV{"PROP"}; $v = $ENV{"VALUE"}; $changed = 0 }
+    $changed += s{(<\Q$p\E>\s*)[^<]+(\s*</\Q$p\E>)}{$1$v$2}s;
+    END { exit($changed ? 0 : 2) }
+  ' "$pom" || die "could not update <$prop> in $pom"
+}
+
+core_version() {
+  project_version "$FHIR_CORE"
+}
+
+kindling_version() {
+  project_version "$KINDLING"
+}
+
+publisher_version() {
+  project_version "$IG_PUBLISHER"
+}
+
+repo_status_line() {
+  local label="$1"
+  local path="$2"
+  if [[ ! -d "$path/.git" ]]; then
+    printf '%-13s %s (not cloned)\n' "$label" "$path"
+    return
+  fi
+  local branch sha dirty
+  branch="$(git -C "$path" rev-parse --abbrev-ref HEAD)"
+  sha="$(git -C "$path" rev-parse --short HEAD)"
+  dirty=""
+  if [[ -n "$(git -C "$path" status --porcelain)" ]]; then
+    dirty=" dirty"
+  fi
+  printf '%-13s %s @ %s %s%s\n' "$label" "$path" "$branch" "$sha" "$dirty"
+}
+
+artifact_file() {
+  local group="$1"
+  local artifact="$2"
+  local version="$3"
+  local ext="${4:-pom}"
+  local group_path="${group//.//}"
+  printf '%s/%s/%s/%s/%s-%s.%s\n' "$M2_REPO" "$group_path" "$artifact" "$version" "$artifact" "$version" "$ext"
+}
+
+check_artifact() {
+  local group="$1"
+  local artifact="$2"
+  local version="$3"
+  local ext="${4:-pom}"
+  local path
+  path="$(artifact_file "$group" "$artifact" "$version" "$ext")"
+  if [[ -f "$path" ]]; then
+    printf 'ok      %s:%s:%s (%s)\n' "$group" "$artifact" "$version" "$path"
+  else
+    printf 'missing %s:%s:%s (%s)\n' "$group" "$artifact" "$version" "$path"
+  fi
+}
+
+clone_one() {
+  local url="$1"
+  local path="$2"
+  if [[ -d "$path/.git" ]]; then
+    printf '%s already exists\n' "$path"
+  else
+    mkdir -p "$(dirname "$path")"
+    git clone "$url" "$path"
+  fi
+}
+
+clone_all() {
+  clone_one "$CORE_URL" "$FHIR_CORE"
+  clone_one "$KINDLING_URL" "$KINDLING"
+  clone_one "$PUBLISHER_URL" "$IG_PUBLISHER"
+}
+
+parse_build_args() {
+  WITH_TESTS=0
+  LOCAL_CORE=0
+  CORE_OVERRIDE=""
+  EXTRA_ARGS=()
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --with-tests)
+        WITH_TESTS=1
+        shift
+        ;;
+      --local-core)
+        LOCAL_CORE=1
+        shift
+        ;;
+      --core-version)
+        [[ $# -ge 2 ]] || die "--core-version requires a value"
+        CORE_OVERRIDE="$2"
+        shift 2
+        ;;
+      --)
+        shift
+        EXTRA_ARGS+=("$@")
+        break
+        ;;
+      *)
+        EXTRA_ARGS+=("$1")
+        shift
+        ;;
+    esac
+  done
+}
+
+core_override_value() {
+  if [[ -n "$CORE_OVERRIDE" ]]; then
+    printf '%s\n' "$CORE_OVERRIDE"
+  elif [[ "$LOCAL_CORE" -eq 1 ]]; then
+    core_version
+  fi
+}
+
+mvn_project() {
+  local project_dir="$1"
+  shift
+  require_file "$MAVEN"
+  require_file "$project_dir/pom.xml"
+  mkdir -p "$M2_REPO"
+  "$MAVEN" -Dmaven.repo.local="$M2_REPO" -f "$project_dir/pom.xml" "$@"
+}
+
+mvn_raw() {
+  require_file "$MAVEN"
+  mkdir -p "$M2_REPO"
+  "$MAVEN" -Dmaven.repo.local="$M2_REPO" "$@"
+}
+
+build_core() {
+  parse_build_args "$@"
+  local skip_args=()
+  [[ "$WITH_TESTS" -eq 1 ]] || skip_args=(-DskipTests)
+  mvn_project "$FHIR_CORE" clean install "${skip_args[@]}" "${EXTRA_ARGS[@]}"
+}
+
+ref_slug() {
+  printf '%s' "$1" | tr -c 'A-Za-z0-9._-' '_' | sed 's/^_*//; s/_*$//'
+}
+
+build_core_ref() {
+  [[ $# -ge 1 ]] || die "build-core-ref requires a git ref"
+  local ref="$1"
+  shift
+  parse_build_args "$@"
+  local slug worktree skip_args=()
+  slug="$(ref_slug "$ref")"
+  [[ -n "$slug" ]] || die "could not derive worktree name from ref: $ref"
+  worktree="$ROOT/tmp/worktrees/fhir-core-$slug"
+  require_file "$FHIR_CORE/pom.xml"
+  if [[ -e "$worktree/.git" ]]; then
+    git -C "$worktree" checkout --detach "$ref"
+  elif [[ -e "$worktree" ]]; then
+    die "worktree path exists but is not a git worktree: $worktree"
+  else
+    mkdir -p "$(dirname "$worktree")"
+    git -C "$FHIR_CORE" worktree add --detach "$worktree" "$ref"
+  fi
+  [[ "$WITH_TESTS" -eq 1 ]] || skip_args=(-DskipTests)
+  mvn_project "$worktree" clean install "${skip_args[@]}" "${EXTRA_ARGS[@]}"
+}
+
+build_kindling() {
+  parse_build_args "$@"
+  local skip_args=()
+  local version_args=()
+  [[ "$WITH_TESTS" -eq 1 ]] || skip_args=(-DskipTests)
+  if [[ -n "$(core_override_value)" ]]; then
+    version_args=(-DfhirCoreVersion="$(core_override_value)")
+  fi
+  mvn_project "$KINDLING" clean install "${skip_args[@]}" "${version_args[@]}" "${EXTRA_ARGS[@]}"
+}
+
+build_publisher() {
+  parse_build_args "$@"
+  local skip_args=()
+  local version_args=()
+  [[ "$WITH_TESTS" -eq 1 ]] || skip_args=(-DskipTests)
+  if [[ -n "$(core_override_value)" ]]; then
+    version_args=(-Dcore_version="$(core_override_value)")
+  fi
+  mvn_project "$IG_PUBLISHER" clean install "${skip_args[@]}" "${version_args[@]}" "${EXTRA_ARGS[@]}"
+}
+
+build_all() {
+  build_core "$@"
+  build_kindling "$@"
+  build_publisher "$@"
+}
+
+align_poms() {
+  local cv
+  cv="$(core_version)"
+  set_pom_property "$KINDLING/pom.xml" "fhirCoreVersion" "$cv"
+  set_pom_property "$IG_PUBLISHER/pom.xml" "core_version" "$cv"
+  printf 'aligned Kindling and IG Publisher core dependency properties to %s\n' "$cv"
+}
+
+publisher_jar_path() {
+  local pv
+  pv="$(publisher_version)"
+  printf '%s/org.hl7.fhir.publisher.cli/target/org.hl7.fhir.publisher.cli-%s.jar\n' "$IG_PUBLISHER" "$pv"
+}
+
+publisher_jar() {
+  local jar
+  jar="$(publisher_jar_path)"
+  if [[ -f "$jar" ]]; then
+    printf '%s\n' "$jar"
+  else
+    printf '%s (not built yet)\n' "$jar"
+  fi
+}
+
+publisher_run() {
+  local jar
+  jar="$(publisher_jar_path)"
+  if [[ ! -f "$jar" ]]; then
+    printf 'publisher jar missing; building publisher first\n' >&2
+    build_publisher
+  fi
+  java -jar "$jar" "$@"
+}
+
+parse_spec_args() {
+  LOCAL_CORE=0
+  CORE_OVERRIDE=""
+  KINDLING_OVERRIDE=""
+  GRADLE_ARGS=()
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --local-core)
+        LOCAL_CORE=1
+        shift
+        ;;
+      --core-version)
+        [[ $# -ge 2 ]] || die "--core-version requires a value"
+        CORE_OVERRIDE="$2"
+        shift 2
+        ;;
+      --kindling-version)
+        [[ $# -ge 2 ]] || die "--kindling-version requires a value"
+        KINDLING_OVERRIDE="$2"
+        shift 2
+        ;;
+      --)
+        shift
+        GRADLE_ARGS+=("$@")
+        break
+        ;;
+      *)
+        GRADLE_ARGS+=("$1")
+        shift
+        ;;
+    esac
+  done
+}
+
+spec_gradle() {
+  parse_spec_args "$@"
+  require_file "$FHIR_SPEC/gradlew"
+  require_file "$GRADLE_INIT"
+  mkdir -p "$GRADLE_HOME"
+  local kindling_arg core_arg=()
+  kindling_arg="${KINDLING_OVERRIDE:-$(kindling_version)}"
+  if [[ -n "$(core_override_value)" ]]; then
+    core_arg=(-DfhirPerf.coreVersion="$(core_override_value)")
+  fi
+  (
+    cd "$FHIR_SPEC"
+    GRADLE_USER_HOME="$GRADLE_HOME" ./gradlew \
+      --init-script "$GRADLE_INIT" \
+      -DfhirPerf.mavenLocal="$M2_REPO" \
+      "${core_arg[@]}" \
+      -PkindlingVersion="$kindling_arg" \
+      --refresh-dependencies \
+      "${GRADLE_ARGS[@]}"
+  )
+}
+
+spec_publish() {
+  local spec_flags=()
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --local-core)
+        spec_flags+=("$1")
+        shift
+        ;;
+      --core-version|--kindling-version)
+        [[ $# -ge 2 ]] || die "$1 requires a value"
+        spec_flags+=("$1" "$2")
+        shift 2
+        ;;
+      --)
+        shift
+        break
+        ;;
+      *)
+        break
+        ;;
+    esac
+  done
+  if [[ "${1:-}" == "--" ]]; then
+    shift
+  fi
+  if [[ $# -gt 0 ]]; then
+    spec_gradle "${spec_flags[@]}" -- publish --args="$*"
+  else
+    spec_gradle "${spec_flags[@]}" -- publish
+  fi
+}
+
+status() {
+  printf 'FHIR perf gym: %s\n\n' "$ROOT"
+  repo_status_line "fhir-core" "$FHIR_CORE"
+  repo_status_line "kindling" "$KINDLING"
+  repo_status_line "publisher" "$IG_PUBLISHER"
+  repo_status_line "spec" "$FHIR_SPEC"
+  printf '\n'
+  printf 'Maven local repo: %s\n' "$M2_REPO"
+  printf 'Gradle user home: %s\n' "$GRADLE_HOME"
+  printf 'Maven command:    %s\n' "$MAVEN"
+  printf '\n'
+  if [[ -f "$FHIR_CORE/pom.xml" ]]; then
+    printf 'fhir-core version:       %s\n' "$(core_version)"
+  fi
+  if [[ -f "$KINDLING/pom.xml" ]]; then
+    local kcore
+    kcore="$(pom_property "$KINDLING" fhirCoreVersion)"
+    printf 'kindling version:        %s\n' "$(kindling_version)"
+    printf 'kindling fhirCoreVersion:%s\n' " $kcore"
+    if [[ -f "$FHIR_CORE/pom.xml" && "$kcore" != "$(core_version)" ]]; then
+      printf 'kindling/core mismatch:  yes; use --local-core only for intentional API-change tests\n'
+    fi
+  fi
+  if [[ -f "$IG_PUBLISHER/pom.xml" ]]; then
+    local pcore
+    pcore="$(pom_property "$IG_PUBLISHER" core_version)"
+    printf 'publisher version:       %s\n' "$(publisher_version)"
+    printf 'publisher core_version:  %s\n' "$pcore"
+    if [[ -f "$FHIR_CORE/pom.xml" && "$pcore" != "$(core_version)" ]]; then
+      printf 'publisher/core mismatch: yes; use --local-core only for intentional API-change tests\n'
+    fi
+  fi
+  if [[ -f "$FHIR_SPEC/gradle.properties" ]]; then
+    printf 'spec kindlingVersion:    %s\n' "$(sed -n 's/^kindlingVersion=//p' "$FHIR_SPEC/gradle.properties" | head -n 1)"
+  fi
+}
+
+doctor() {
+  status
+  printf '\nChecks:\n'
+  command -v java >/dev/null && java -version >/dev/null
+  printf 'ok      java\n'
+  require_file "$MAVEN"
+  "$MAVEN" -version >/dev/null
+  printf 'ok      Maven wrapper\n'
+  require_file "$FHIR_SPEC/gradlew"
+  printf 'ok      spec Gradle wrapper\n'
+}
+
+local_artifacts() {
+  local cv kv pv
+  cv="$(core_version)"
+  kv="$(kindling_version)"
+  pv="$(publisher_version)"
+  check_artifact ca.uhn.hapi.fhir org.hl7.fhir.core "$cv"
+  check_artifact ca.uhn.hapi.fhir org.hl7.fhir.r5 "$cv" jar
+  check_artifact ca.uhn.hapi.fhir org.hl7.fhir.validation "$cv" jar
+  check_artifact org.hl7.fhir kindling "$kv" jar
+  check_artifact org.hl7.fhir.publisher org.hl7.fhir.publisher.cli "$pv" jar
+}
+
+cmd="${1:-help}"
+if [[ $# -gt 0 ]]; then
+  shift
+fi
+
+case "$cmd" in
+  help|-h|--help)
+    usage
+    ;;
+  clone)
+    clone_all
+    ;;
+  status)
+    status
+    ;;
+  doctor)
+    doctor
+    ;;
+  build-core)
+    build_core "$@"
+    ;;
+  build-core-ref)
+    build_core_ref "$@"
+    ;;
+  build-kindling)
+    build_kindling "$@"
+    ;;
+  build-publisher)
+    build_publisher "$@"
+    ;;
+  build-all)
+    build_all "$@"
+    ;;
+  align-poms)
+    align_poms
+    ;;
+  local-artifacts)
+    local_artifacts
+    ;;
+  publisher-jar)
+    publisher_jar
+    ;;
+  publisher-run)
+    publisher_run "$@"
+    ;;
+  spec-deps)
+    spec_gradle "$@" -- dependencies --configuration compileClasspath
+    ;;
+  spec-print)
+    spec_gradle "$@" -- printVersion
+    ;;
+  spec-publish)
+    spec_publish "$@"
+    ;;
+  spec-gradle)
+    spec_gradle "$@"
+    ;;
+  mvn)
+    mvn_raw "$@"
+    ;;
+  *)
+    usage >&2
+    die "unknown command: $cmd"
+    ;;
+esac

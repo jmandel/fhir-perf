@@ -1,0 +1,11 @@
+rootProject {
+  afterEvaluate { p ->
+    p.tasks.register('printRuntimeClasspath') {
+      doLast {
+        println("CLASSPATH-BEGIN")
+        println(p.sourceSets.main.compileClasspath.asPath)
+        println("CLASSPATH-END")
+      }
+    }
+  }
+}
