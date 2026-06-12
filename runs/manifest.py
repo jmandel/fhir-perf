@@ -10,6 +10,8 @@ TS = [
     re.compile(rb"(Mon|Tue|Wed|Thu|Fri|Sat|Sun), [A-Z][a-z]{2} \d{1,2}, \d{4} \d{2}:\d{2}([+-]\d{4})?"),
     # bare times like 09:45:07
     re.compile(rb"\b\d{2}:\d{2}:\d{2}\b"),
+    # render dates like "11 Jun 2026" (expansion-generated lines on valueset pages)
+    re.compile(rb"\b\d{1,2} (Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec) \d{4}\b"),
     # random UUIDs in generated html (table script ids, image names)
     re.compile(rb"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}"),
     # section numbers: unstable across identical stock runs (HashMap order in vs/cs numbering)

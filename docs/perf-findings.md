@@ -179,3 +179,17 @@ e9e60c989), kindling `perf/overlap-validation` (was spike/s11..., overlap now op
 fixes a92b35a+ddb7d7e), `perf/terminology-fold` (clean single-commit extraction 3ae9326
 replacing spike/s13-fold), `perf/integration-eval` (the composed evidence merge).
 `perf/narrative-lookup-cache` amended to TRANSIENT (40186d0ca).
+
+## Judge-readout correction + demo reference (June 12, evening)
+
+A display filter used in today's session (`grep -v '\.html$'` on judge output) hid 49
+unexplained pages in every judge call since mid-morning. Root-caused: they are the
+LONG-DOCUMENTED local-vs-remote terminology-metadata skew (e.g. FHIRsmith annotates
+IANA-timezone bindings, production tx.fhir.org doesn't) - the committed reference was
+remote-flavored while packs record local answers - plus one genuinely unnormalized date format
+("12 Jun 2026" expansion-generated lines), now added to manifest.py's normalizer. No semantic
+content differed. Consequence for claims: pack-run "byte-exact" = exact signature + judge-clean
+*within the pack's recorded-server flavor*; vs a live-remote build the known ~49-page metadata
+skew applies (the drift class txpack exists to pin). The future-world demo branch
+(jmandel/fhir @ txpack-future) therefore ships a reference manifest generated from its own
+pinned toolchain+pack configuration.
