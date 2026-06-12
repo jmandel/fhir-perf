@@ -302,6 +302,16 @@ https://github.com/hapifhir/org.hl7.fhir.core/blob/5c4d5a0ff3b66f26f1365bc8a3e32
 
 **Status / recommendation:** Report-only. In the author's workspace, the build's round-trip count was made deterministic instead, which hides the symptom locally; the asymmetry itself remains upstream. The writer's one-space padding looks intentional (readability of `<!-- text -->`), so the minimal fix is on the parse side: in `XmlParser.reapComments` (both loops), strip the single leading/trailing space that `XMLWriter.comment` adds before storing the string — making compose→parse idempotent — and add a round-trip test asserting `Element.getComments()` is unchanged across two cycles. (Trimming *all* surrounding whitespace would be simpler and also works, at the cost of normalizing comments that deliberately begin or end with extra spaces.)
 
+**Adjacent defect, same writer:** when a comment is written while the writer is already inside a comment, both emit sites terminate it with `-- >` (space before `>`) instead of `-->`:
+
+https://github.com/hapifhir/org.hl7.fhir.core/blob/5c4d5a0ff3b66f26f1365bc8a3e32ad5c561a6f7/org.hl7.fhir.utilities/src/main/java/org/hl7/fhir/utilities/xml/XMLWriter.java#L488-L489
+```java
+		if (levels.inComment())
+			write("  <!-- "+comment+" -- >");
+```
+
+(and the same pattern in `writePendingComment`, [#L501-L502](https://github.com/hapifhir/org.hl7.fhir.core/blob/5c4d5a0ff3b66f26f1365bc8a3e32ad5c561a6f7/org.hl7.fhir.utilities/src/main/java/org/hl7/fhir/utilities/xml/XMLWriter.java#L501-L502)). The intent is presumably to defuse a nested comment, but the output is broken either way: `-- >` is not a comment terminator, and the emitted text still contains `--`, which is illegal inside an XML comment regardless — so any consumer that takes this branch produces non-well-formed XML. The round-trip idempotence test recommended above would surface this branch too.
+
 ---
 
 ## 7. The spec build is not deterministic (same inputs → different published bytes)
