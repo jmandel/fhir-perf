@@ -10,7 +10,7 @@ This document is the map from what we built to how we hand it over.
   waits, visible on the fork and listed here so the roadmap is inspectable without being a queue
   of review obligations.
 - **One consolidated bug report**, not 14 issues. `docs/upstream-bugs.md` (audited, each bug
-  verified against stock code with a repro) goes out as a single Zulip post / gist. Individual
+  verified against stock code with a repro) goes out as a single Zulip post linking the doc in `jmandel/fhir-perf` (repo currently private — flip public before posting). Individual
   GitHub issues get filed only when (a) a PR fixes one (so the PR can say "fixes #N") or (b) the
   maintainer asks for one.
 - **Design discussion before architecture code.** The txpack series does not open as PRs until
