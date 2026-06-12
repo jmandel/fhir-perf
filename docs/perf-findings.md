@@ -52,7 +52,7 @@ All runs: cold tx-cache, local FHIRsmith tx, 12-thread validation, all earlier s
 | Run | Wallclock | Correctness |
 |---|---|---|
 | Spike A — fhir-core terminology fixes (branch `spike/core-txperf`) | **287s (3×)** | rc=0, Errors=0/Warnings=3693 (exact parity), 0 CME |
-| Spike B — overlap validation with produce tail (branch `spike/s11-overlap-validation`) | unmeasurable alone | pre-A race corrupted both attempts (220 bogus errors) |
+| Spike B — overlap validation with produce tail (branch `perf/overlap-validation`) | unmeasurable alone | pre-A race corrupted both attempts (220 bogus errors) |
 | A + B stacked | **246s** | rc=0, exact parity |
 | A + B + adversarial-review fixes (`e6ee120ac`) | **227s** | rc=0, exact parity |
 | A + B warm (after poisoned-cache purge) | 255s | rc=0 |
@@ -85,7 +85,7 @@ Bench matrix on `perf/integrated` + `spike/core-txperf` jars: cold-remote **415s
 
 tx.lock details: pack built by `TerminologyCachePackager` from a captured corpus — poison entries structurally unrepresentable (25 filtered, matching independent grep), manifest records source server + effective edition versions extracted from responses + content sha256, pack named by hash, consumed as an immutable read-only seed layer, `-Dorg.hl7.fhir.tx.hermetic` + miss logging included. Remaining 713 requests (4,205 logged misses, mostly locally-resolved): dominated by `all-systems` (1,028 validate misses — likely key-instability from transient ValueSet urls embedded in request JSON), v2-0487, expansion classes. Key canonicalization of the all-systems class is the path to hermetic/zero-traffic.
 
-## tx.lock final state (spike/core-coldpack @ f88bdf197)
+## tx.lock final state (txpack/chain @ f88bdf197)
 
 The pack format is complete and self-contained: validate-code answers (incl. deterministic semantic errors via `-Dorg.hl7.fhir.tx.recordSemanticErrors` recording runs), expansions **including deterministic server refusals** (two-tier poison predicate: transport markers unconditional, HTTP-wrapper markers pass only for an allowlisted refusal text), VS/CS external resolutions **with negatives as first-class content**, the tx-registry system map (read-only seed in TerminologyClientManager), and server capability artifacts. Packs are content-addressed, manifest provenance + effective editions, structurally poison-free, `merge`-able for top-ups. 55/55 tests.
 
@@ -155,3 +155,27 @@ Convergence measured (cold, local server, kindling-s12, all runs **rc=0 byte-exa
 - `runs/judge.sh LABEL` — diffs beyond the known nondeterminism allowlist (`noise-files-v2.txt`, 226 files).
 - `runs/cold-run.sh LABEL ...` — stashes `~/.fhir/tx-cache` for the run, preserves resulting cache, restores.
 - Reference: `runs/ref-publish/` + `ref.manifest` (converged build output). Frozen dependency jars: `runs/cp-frozen/`.
+
+## Review round and consolidation (June 12, afternoon)
+
+The full chain (12 core commits + kindling s10/heuristic/s11 + the extracted fold) went through
+a per-commit adversarial review (one reviewer agent per commit; every major finding sent to a
+refuter that only confirms problems present at branch tip). 43 agents, 24 confirmed majors, all
+fixed; full record in `runs/review-spike-chain.json`. Dominant theme: unflagged default-behavior
+changes — fixed by one rule, "pack machinery only acts when pack/recording mode is on":
+localFirst and adaptive throttle now strictly opt-in; precedence/arming gated on pack-or-recording;
+canonical keys gated likewise (default runs keep stock keys — no silent cache invalidation);
+capability capture recording-only; localWarning answers TRANSIENT by default; plus correctness
+hardening (grammar shortcut defers to locally loaded CodeSystems; unknown-system memo keyed by
+(system, vs) pair; pack ServerOptionList defensively copied; isPackDescribedServer master-only;
+corrupt-page recovery incremental again; packager verify handles zips; ManagedFileAccess sweep).
+
+Post-fix verification (all judge-clean except the known all-valuesets.zip):
+- hermetic-postfix (fixed core + fixed fold, otherwise-stock kindling): 650s, rc=0, 0 requests, 0/3693/345
+- hermetic-integration-v2 (composed PR set perf/integrated + perf/terminology-fold, fixed tips): **211s, rc=0, 0 requests, 0/3693/345**
+
+Branches renamed off spike/: core `txpack/chain` (was spike/core-coldpack, fixes at tip
+e9e60c989), kindling `perf/overlap-validation` (was spike/s11..., overlap now opt-in,
+fixes a92b35a+ddb7d7e), `perf/terminology-fold` (clean single-commit extraction 3ae9326
+replacing spike/s13-fold), `perf/integration-eval` (the composed evidence merge).
+`perf/narrative-lookup-cache` amended to TRANSIENT (40186d0ca).

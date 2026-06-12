@@ -26,12 +26,16 @@ Performance and correctness work on the core FHIR specification build
 
 All code lives as plain branches on forks (nothing is PR'd upstream yet — see the plan doc):
 
+All branches went through a per-commit adversarial review round; all 24 confirmed major
+findings are fixed and re-verified (see the plan doc's verification table).
+
 - fhir-core: [`perf/tx-thread-safety`](https://github.com/jmandel/org.hl7.fhir.core/tree/perf/tx-thread-safety) (master-based, suites green),
   [`perf/narrative-lookup-cache`](https://github.com/jmandel/org.hl7.fhir.core/tree/perf/narrative-lookup-cache) (master-based),
-  [`spike/core-coldpack`](https://github.com/jmandel/org.hl7.fhir.core/tree/spike/core-coldpack) (the measured txpack chain, 6.9.1 line)
+  [`txpack/chain`](https://github.com/jmandel/org.hl7.fhir.core/tree/txpack/chain) (the measured txpack chain, 6.9.1 line; default-off everywhere)
 - kindling: [`perf/integrated`](https://github.com/jmandel/kindling/tree/perf/integrated) (main-based, parity-verified),
-  [`spike/s11-overlap-validation`](https://github.com/jmandel/kindling/tree/spike/s11-overlap-validation),
-  [`spike/s13-fold`](https://github.com/jmandel/kindling/tree/spike/s13-fold)
+  [`perf/overlap-validation`](https://github.com/jmandel/kindling/tree/perf/overlap-validation) (opt-in),
+  [`perf/terminology-fold`](https://github.com/jmandel/kindling/tree/perf/terminology-fold) (compiles against released core),
+  [`perf/integration-eval`](https://github.com/jmandel/kindling/tree/perf/integration-eval) (composed PR set: hermetic full build, 211s, zero network, exact output)
 
 ### Measurement harness (runs/)
 

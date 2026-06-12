@@ -1,6 +1,6 @@
 # txpack: Immutable Terminology Answer Packs for the FHIR Core Build
 
-**Proposal.** Replace the spec build's mutable per-machine terminology cache and its zip publish pipeline with **txpacks**: immutable, content-addressed snapshots of recorded terminology-server answers, pinned by a ~1KB `tx.lock` file in the repo. The design is implemented and measured: a fully cold build with a pack matches a warm build (195s vs 197s, byte-identical output), and a hermetic build — full cold build, **zero network requests** — completes in 231s with the exact reference output signature (rc=0, Errors=0 / Warnings=3693 / Info=345). Working branches: fhir-core [`spike/core-coldpack`](https://github.com/jmandel/org.hl7.fhir.core/tree/spike/core-coldpack), kindling [`spike/s13-fold`](https://github.com/jmandel/kindling/tree/spike/s13-fold).
+**Proposal.** Replace the spec build's mutable per-machine terminology cache and its zip publish pipeline with **txpacks**: immutable, content-addressed snapshots of recorded terminology-server answers, pinned by a ~1KB `tx.lock` file in the repo. The design is implemented and measured: a fully cold build with a pack matches a warm build (195s vs 197s, byte-identical output), and a hermetic build — full cold build, **zero network requests** — completes in 231s with the exact reference output signature (rc=0, Errors=0 / Warnings=3693 / Info=345). Working branches: fhir-core [`txpack/chain`](https://github.com/jmandel/org.hl7.fhir.core/tree/txpack/chain), kindling [`perf/terminology-fold`](https://github.com/jmandel/kindling/tree/perf/terminology-fold).
 
 All measurements: full `-nopartial` core build, 12-core/62GB machine, on top of separately-proposed build optimizations (parallel validation, lock fixes — under which the stock 683s warm build runs at ~197s). Detailed run logs are in the companion `perf-findings.md`.
 
@@ -165,6 +165,6 @@ Packs are keyed by request content, not by repo or branch — every branch and e
 
 ---
 
-[^1]: Hermetic evidence artifact: pack `txpack-36913cc2…`, fhir-core [`spike/core-coldpack`](https://github.com/jmandel/org.hl7.fhir.core/tree/spike/core-coldpack), kindling [`spike/s13-fold`](https://github.com/jmandel/kindling/tree/spike/s13-fold). Output judged clean against the reference except `all-valuesets.zip`, a known zip nondeterminism that differs even between two stock runs.
+[^1]: Hermetic evidence artifact: pack `txpack-36913cc2…`, fhir-core [`txpack/chain`](https://github.com/jmandel/org.hl7.fhir.core/tree/txpack/chain), kindling [`perf/terminology-fold`](https://github.com/jmandel/kindling/tree/perf/terminology-fold). Output judged clean against the reference except `all-valuesets.zip`, a known zip nondeterminism that differs even between two stock runs.
 
 *Companion documents: `perf-findings.md` (full measurement log), `upstream-bugs.md` (14 bugs with repros), `cold-start-moonshots.md` (design alternatives considered).*

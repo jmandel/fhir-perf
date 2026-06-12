@@ -51,19 +51,21 @@ at its commit boundaries:
 **A2. Narrative-path lookup caching** — branch
 [`perf/narrative-lookup-cache`](https://github.com/jmandel/org.hl7.fhir.core/tree/perf/narrative-lookup-cache)
 (single commit
-[`4b454b43d`](https://github.com/jmandel/org.hl7.fhir.core/commit/4b454b43dbbcd55fa1cb4a2719aa22ed8e1301f5)
-on current master, independent of A1; `TerminologyCacheTests` 59/59). Fixes the
+[`40186d0ca`](https://github.com/jmandel/org.hl7.fhir.core/commit/40186d0ca)
+on current master, independent of A1; `TerminologyCacheTests` green). Fixes the
 "go with the local warning" early return in `validateCode(Coding)` that skips the cache store:
 today every narrative `lookupCode` of an unknown code system is a fresh server round trip on
 **every example, every build, forever**. The rebuilt WARNING answer is fully determined by the
-local warning, so caching it is byte-identical and removes permanent redundant traffic.
+local warning, so it caches TRANSIENT: repeats within a run come from memory, and across runs
+the build re-asks once — exactly the adjacent "keep trying (but only once per run)" policy,
+which this branch makes that path finally honor.
 
 ### Wave 2 — after Wave 1 merges (flag-gated, ports to master needed)
 
 | PR | Source (6.9.1 spike line) | Flag | Dependency |
 |---|---|---|---|
-| A3. Local evaluation memoization | [`33bb89dd1`](https://github.com/jmandel/org.hl7.fhir.core/commit/33bb89dd1) on `spike/core-coldpack` | `-Dorg.hl7.fhir.tx.evalMemo` | Stacked on A1.1 (relies on its synchronized accessors) |
-| A4. Local-first grammar-system answering | [`d7f9f3e06`](https://github.com/jmandel/org.hl7.fhir.core/commit/d7f9f3e06) on `spike/core-coldpack` | `-Dorg.hl7.fhir.tx.localFirst` | Independent; parity-verified shapes only (UCUM / BCP-47 / BCP-13) |
+| A3. Local evaluation memoization | [`33bb89dd1`](https://github.com/jmandel/org.hl7.fhir.core/commit/33bb89dd1) on `txpack/chain` | `-Dorg.hl7.fhir.tx.evalMemo` | Stacked on A1.1 (relies on its synchronized accessors) |
+| A4. Local-first grammar-system answering | [`d7f9f3e06`](https://github.com/jmandel/org.hl7.fhir.core/commit/d7f9f3e06) on `txpack/chain` | `-Dorg.hl7.fhir.tx.localFirst` | Independent; parity-verified shapes only (UCUM / BCP-47 / BCP-13) |
 
 These exist verified on the 6.9.1 line; the master ports are mechanical but each needs its
 parity manifest re-run before opening.
@@ -71,7 +73,7 @@ parity manifest re-run before opening.
 ### Wave 3 — txpack (design discussion first; then a 5-step stacked series)
 
 Working illustration: branch
-[`spike/core-coldpack`](https://github.com/jmandel/org.hl7.fhir.core/tree/spike/core-coldpack)
+[`txpack/chain`](https://github.com/jmandel/org.hl7.fhir.core/tree/txpack/chain)
 — the complete, measured chain on the 6.9.1 line (every commit was built and wallclock/parity
 verified; this is the branch Zulip readers click). Proposal: `docs/txpack-proposal.md`.
 Headline evidence: cold build with pack = warm build (195s vs 197s, byte-identical);
@@ -107,20 +109,22 @@ commit boundaries:
 
 ### Wave 2 — after first core release containing A1
 
-Branch [`spike/s11-overlap-validation`](https://github.com/jmandel/kindling/tree/spike/s11-overlap-validation):
+Branch [`perf/overlap-validation`](https://github.com/jmandel/kindling/tree/perf/overlap-validation):
 overlap example validation with the page-production tail. Requires core thread-safety at
 runtime; opens once a core release ships A1.1.
 
 ### Wave 3 — with/after txpack
 
-Branch [`spike/s13-fold`](https://github.com/jmandel/kindling/tree/spike/s13-fold) (note: its
-history sits atop the parked s12 two-pass commit; the final PRs cherry-pick the fold commit
-[`dd71c62`](https://github.com/jmandel/kindling/commit/dd71c62328a7693550cbfb19e6a155a789c8a342)
-out, dropping s12). Splits into:
+Branch [`perf/terminology-fold`](https://github.com/jmandel/kindling/tree/perf/terminology-fold):
+a single clean commit on main (extracted from the s13 spike, dropping its two-pass coupling),
+compiles against released fhir-core, reviewed + review findings fixed. Two parts:
 - **Early-eligible** (could even join Wave 1.5): route `lookupLoinc` through the normal
-  terminology client (kills 56 eternally-404ing direct probes per build) and delete the
-  hardcoded tx.fhir.org fallback URL.
-- **txpack-coupled**: bootstrap metadata gating in pack/hermetic mode (needs core T3/T5).
+  terminology client (kills 56 eternally-404ing direct probes per build) and replace the
+  hardcoded tx.fhir.org fallback with a hard error; lookup outages and authoritative
+  not-found answers are distinguished by error class (review fix).
+- **txpack-coupled**: in pack/hermetic mode, skip the bootstrap metadata ping AND the
+  TerminologyCacheManager refresh (kindling-side only — no core API needed; review fix:
+  against released core, a null version stamp would have wiped the recorded cache dir).
 
 ---
 
@@ -135,7 +139,7 @@ descriptions, not duplicate issues.
 ## The txpack conversation
 
 Zulip post anchored by: `docs/txpack-proposal.md` (self-contained design doc) + the clickable
-`spike/core-coldpack` chain + the headline measurement (hermetic zero-network build, exact
+`txpack/chain` chain + the headline measurement (hermetic zero-network build, exact
 output parity). The post explicitly invites the "requests don't pin editions" design objection
 the proposal addresses head-on (manifest pins effective editions; freshness = reviewed
 lock-bump diff; it replaces the existing un-gated zip pipeline using the same credentials).
@@ -152,14 +156,20 @@ lock-bump diff; it replaces the existing un-gated zip pipeline using the same cr
 
 ## Verification status of pushed branches
 
+Every branch below went through a 16-commit adversarial review round (one reviewer agent per
+commit, every major finding adversarially refuted or confirmed; 24 confirmed majors all fixed)
+followed by individual re-verification, and the kindling PR set was evaluated as a composed
+merge. Full review record: `runs/review-spike-chain.json`.
+
 | Branch | Base | Verified |
 |---|---|---|
 | core `perf/tx-thread-safety` | master | full test suites green; reviewed (prior session) |
-| core `perf/narrative-lookup-cache` | master | compiles; TerminologyCacheTests 59/59; fix proven end-to-end on the 6.9.1 line (hermetic-v4) |
-| core `spike/core-coldpack` | 6.9.0 (6.9.1 line) | every commit built + measured; 55/55 cache/packager tests; hermetic zero-network build verified |
+| core `perf/narrative-lookup-cache` | master | reviewed + fixed (TRANSIENT per-run dedupe, matching the keep-trying policy); TerminologyCacheTests green |
+| core `txpack/chain` | 6.9.0 (6.9.1 line) | every commit built + measured; reviewed + 18 confirmed majors fixed at tip (flag discipline: default runs behave stock); 59 cache/packager tests + 4 throttle tests; hermetic zero-network re-verified post-fix |
 | kindling `perf/integrated` | main | output-parity verified; reviewed (prior session) |
-| kindling `spike/s11-overlap-validation` | main (spike chain) | measured; requires core A1 at runtime |
-| kindling `spike/s13-fold` | main (atop s11+s12) | measured as part of the pack/hermetic runs |
+| kindling `perf/overlap-validation` | main (spike chain) | reviewed + 4 confirmed majors fixed (incl. overlap now opt-in); builds clean; full measurement at Wave-2 port time |
+| kindling `perf/terminology-fold` | main | reviewed + 2 confirmed majors fixed; compiles against released core; hermetic zero-network verified standalone (650s on otherwise-stock kindling) |
+| kindling `perf/integration-eval` | main | merge of `perf/integrated` + `perf/terminology-fold` (fixed tips): **hermetic full build 211s, rc=0, zero network requests, exact 0/3693/345** |
 
 ## Sequencing at a glance
 
