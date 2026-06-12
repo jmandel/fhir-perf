@@ -193,3 +193,32 @@ content differed. Consequence for claims: pack-run "byte-exact" = exact signatur
 skew applies (the drift class txpack exists to pin). The future-world demo branch
 (jmandel/fhir @ txpack-future) therefore ships a reference manifest generated from its own
 pinned toolchain+pack configuration.
+
+## Future-world demo on GitHub CI (June 12-13, jmandel/fhir @ txpack-future)
+
+A self-contained shadow environment of the proposed future, on the spec itself: tx.lock pins an
+immutable pack + tooling jar (content-addressed release assets; GitHub Packages rejected - auth
+required even for public reads), eng/future/build.sh (default path: bash/curl/sha256sum/java
+only), parity tooling, and split CI. **Green end-to-end on 4-core/16GB GitHub runners**: fresh
+clone -> hermetic cold build in ~3.5-4 min (vs ~18+ min stock cold against tx.fhir.org), zero
+terminology network (enforced), exact signature - plus an optional reproducibility job (double
+build, evidence-based + order-insensitive judged parity vs a committed reference manifest).
+
+Nine CI iterations produced an environment-leak catalogue, each found by the hermetic gate or
+the parity judge doing its job (stock builds silently absorb all of these):
+locale -> terminology request keys; absolute checkout path and OS username -> page content
+(bug 7 item 5); installed fonts -> POI xlsx column widths; filesystem enumeration order ->
+archive member order; thread timing -> element ordering, a flickering language-designations
+table (cause unverified), and a local-expansion fallback (v3-ActReason) that fell through an
+unguarded prefetch retry to the network - fixed by porting the review's retry guard into
+perf/integrated (commit 6e84496) and bumping the pinned jar (kindling-future-v2.jar), itself a
+live example of the lock-bump discipline.
+
+Comparison taxonomy settled with sharp edges: per-push CI gate = ONE build (hermetic +
+signature; ~4 min - the everyday cost); bump review = same-machine OLD-vs-NEW output A/B (the
+refresh workflow's layer 1, feeding the lock-bump PR body + a GitHub Models-written explanation
+section, narrative-only); committed-reference parity = the OPTIONAL reproducibility stretch
+track (runs on [parity] tag/dispatch), where double-build evidence + O-tier (order-insensitive
+second-chance hashing, tamper-verified) keep noise excusal honest without allowlist blindness.
+Pack-vs-live equivalence is established once at recording time and inherited transitively.
+Manifest tooling: parallelized 74s -> 14s (Python 3.14 non-fork multiprocessing gotcha), opt-in.

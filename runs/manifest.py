@@ -10,6 +10,8 @@ TS = [
     re.compile(rb"(Mon|Tue|Wed|Thu|Fri|Sat|Sun), [A-Z][a-z]{2} \d{1,2}, \d{4} \d{2}:\d{2}([+-]\d{4})?"),
     # bare times like 09:45:07
     re.compile(rb"\b\d{2}:\d{2}:\d{2}\b"),
+    # the build embeds the OS username in page footers ("Local Build (jmandel)")
+    re.compile(rb"Local Build \([^)]*\)"),
     # render dates like "11 Jun 2026" (expansion-generated lines on valueset pages)
     re.compile(rb"\b\d{1,2} (Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec) \d{4}\b"),
     # random UUIDs in generated html (table script ids, image names)
@@ -45,6 +47,12 @@ def archive_sig(path):
     return hashlib.sha256(out).hexdigest()[:16]
 
 def main(root):
+    # the build embeds its absolute checkout path in published links (htmldiff/jira); make
+    # manifests location-independent by normalizing the path (raw and url-encoded forms)
+    import urllib.parse
+    checkout = os.path.dirname(os.path.abspath(root))
+    for pat in (urllib.parse.quote(checkout, safe="").encode(), checkout.encode()):
+        TS.append(re.compile(re.escape(pat)))
     files = []
     for dp, dn, fn in os.walk(root):
         for n in fn:
