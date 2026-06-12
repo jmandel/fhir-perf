@@ -1,183 +1,608 @@
 # Upstream Bugs Found During FHIR Build Performance Work (June 2026)
 
-All found while profiling/parallelizing the core FHIR spec build (kindling + org.hl7.fhir.core). All code locations and line numbers have been verified against stock upstream code: fhir-core `master` @ 5c4d5a0ff and kindling `main` @ b6cb1f6 (June 2026). Where a measurement was originally taken on the earlier 6.9.1-SNAPSHOT line, that is noted. "Fixed in" refers to branches in this workspace.
+All found while profiling/parallelizing the core FHIR spec build (kindling + org.hl7.fhir.core). Every code location below is a permalink into stock upstream code, pinned to the commits the claims were verified against: fhir-core [`master` @ 5c4d5a0ff](https://github.com/hapifhir/org.hl7.fhir.core/tree/5c4d5a0ff3b66f26f1365bc8a3e32ad5c561a6f7) and kindling [`main` @ b6cb1f6](https://github.com/HL7/kindling/tree/b6cb1f66e49ac8ef4ace2932ad5345cb3e5624d8) (June 2026). Code excerpts are verbatim from those commits. Where a measurement was originally taken on the earlier 6.9.1-SNAPSHOT line, that is noted. "Fixed in" refers to the author's workspace branches; the ones pushed for reference live on the [jmandel/org.hl7.fhir.core](https://github.com/jmandel/org.hl7.fhir.core) and [jmandel/kindling](https://github.com/jmandel/kindling) forks.
 
 ---
 
 ## 1. cache-id terminology protocol yields wrong validation results for grammar-based code systems
 
-**Where:** Protocol interaction between fhir-core's tx client (`TerminologyClientContext.canUseCacheId`, a static flag at TerminologyClientContext.java 74/311; the inline-ValueSet-vs-by-reference switch is `BaseWorkerContext.addServerValidationParameters`, master 1925-1944) and the tx server's cache-id handling — reproduces identically on legacy deployed tx.fhir.org and current FHIRsmith (`tx/` module), so the defect is in the interaction design or shared client behavior, not one server build.
+**Setup.** fhir-core's terminology client supports a `cache-id` protocol: instead of inlining the full ValueSet resource into every `$validate-code` request, the client sends the ValueSet once, then refers to it by `url`/`valueSetVersion` plus a shared `cache-id` on subsequent calls. A static flag, `TerminologyClientContext.canUseCacheId`, gates the whole mechanism ([declaration L74](https://github.com/hapifhir/org.hl7.fhir.core/blob/5c4d5a0ff3b66f26f1365bc8a3e32ad5c561a6f7/org.hl7.fhir.r5/src/main/java/org/hl7/fhir/r5/terminologies/client/TerminologyClientContext.java#L74), [setter L311-L313](https://github.com/hapifhir/org.hl7.fhir.core/blob/5c4d5a0ff3b66f26f1365bc8a3e32ad5c561a6f7/org.hl7.fhir.r5/src/main/java/org/hl7/fhir/r5/terminologies/client/TerminologyClientContext.java#L311-L313)).
 
-**Symptom:** With cache-id enabled, validations against grammar-based "infinite" systems return false negatives: `The value provided ('application/pdf') was not found in the value set 'Mime Types'`, same for `image/jpeg`, `application/dicom`, valid BCP-47 codes, etc. A full spec build went from Errors=0 to **Errors=285**, Warnings shifted 3693→3821.
+**The bug.** The inline-vs-by-reference switch lives in `BaseWorkerContext.addServerValidationParameters`. Once a ValueSet has been registered under the cache-id, later validations send only its url, and the server validates against its registered copy:
 
-**Likely cause:** When the client registers a ValueSet by reference (cache-id) instead of inlining it, validation runs against the registered copy, which loses the special-system semantics of `urn:ietf:bcp:13` (any syntactically valid mimetype is a member) and similar grammar systems — the registered VS behaves as an enumerable set with no members.
+https://github.com/hapifhir/org.hl7.fhir.core/blob/5c4d5a0ff3b66f26f1365bc8a3e32ad5c561a6f7/org.hl7.fhir.r5/src/main/java/org/hl7/fhir/r5/context/BaseWorkerContext.java#L1927-L1935
+```java
+    if (vs != null) {
+      if (terminologyClientContext != null && terminologyClientContext.isTxCaching() && terminologyClientContext.getCacheId() != null && vs.getUrl() != null && terminologyClientContext.getCached().contains(vs.getUrl() + "|" + vs.getVersion())) {
+        pin.addParameter().setName("url").setValue(new UriType(vs.getUrl()));
+        if (vs.hasVersion()) {
+          pin.addParameter().setName("valueSetVersion").setValue(new StringType(vs.getVersion()));
+        }
+      } else if (options.getVsAsUrl()) {
+        pin.addParameter().setName("url").setValue(new UriType(vs.getUrl()));
+      } else {
+```
 
-**Repro:** In kindling, `Publisher.execute` line 686 hard-disables cache-id (`TerminologyClientContext.setCanUseCacheId(false)` — commit 0b65fdc, Sept 24 2024, "No use cache-id on the tx server", with no rationale; this bug is the probable rationale). Re-enable it (or, optionally, use the `-Dfhir.build.tx.usecacheid=true` gate on workspace branch `spike/s9-tx-cold`) and run any spec build; `binary-example` fails on `Binary.contentType` immediately. Minimal repro: register the mimetypes ValueSet via cache-id, then `$validate-code` `application/pdf` against it by reference. (VERIFICATION NEEDED: a raw-HTTP emulation of that two-request sequence against tx.fhir.org/r5 — inline `valueSet` + `cache-id`, then `url`+`valueSetVersion` with the same `cache-id` — was not retained by the server at all ("value set could not be found"), so the minimal repro may need the real client's full cache-id handshake; the build-level repro is the verified one.)
+When the ValueSet draws on a grammar-based "infinite" code system — e.g. `urn:ietf:bcp:13`, where any syntactically valid mimetype is a member — the by-reference path loses those special-system semantics: the registered ValueSet behaves as an enumerable set with no members, so valid codes are rejected. The defect reproduces identically on the legacy deployed tx.fhir.org and on current FHIRsmith (`tx/` module), so it lies in the interaction design or shared client behavior, not one server build.
 
-**Status:** Report-only. Flag remains off.
+kindling works around it by hard-disabling cache-id at the very top of the build, with no recorded rationale (commit 0b65fdc, Sept 24 2024, "No use cache-id on the tx server" — this bug is the probable rationale):
+
+https://github.com/HL7/kindling/blob/b6cb1f66e49ac8ef4ace2932ad5345cb3e5624d8/src/main/java/org/hl7/fhir/tools/publisher/Publisher.java#L685-L687
+```java
+  public void execute(String folder, String[] args) throws IOException {
+    TerminologyClientContext.setCanUseCacheId(false);
+    tester = new PublisherTestSuites();
+```
+
+**Consequences.** With cache-id enabled, validations against grammar-based systems return false negatives: `The value provided ('application/pdf') was not found in the value set 'Mime Types'`, same for `image/jpeg`, `application/dicom`, valid BCP-47 codes, etc. A full spec build went from Errors=0 to **Errors=285**, and Warnings shifted 3693→3821. Meanwhile every build that keeps the flag off pays the cost of inlining full ValueSets on every request.
+
+**Repro.** Remove the `setCanUseCacheId(false)` line in `Publisher.execute` (or use the `-Dfhir.build.tx.usecacheid=true` gate on the author's workspace branch `spike/s9-tx-cold`) and run any spec build; `binary-example` fails on `Binary.contentType` immediately. Minimal repro: register the mimetypes ValueSet via cache-id, then `$validate-code` `application/pdf` against it by reference. (VERIFICATION NEEDED: a raw-HTTP emulation of that two-request sequence against tx.fhir.org/r5 — inline `valueSet` + `cache-id`, then `url`+`valueSetVersion` with the same `cache-id` — was not retained by the server at all ("value set could not be found"), so the minimal repro may need the real client's full cache-id handshake; the build-level repro is the verified one.)
+
+**Status.** Report-only; no fix branch. The kindling flag remains off. The `spike/s9-tx-cold` branch mentioned above is one of the author's local workspace branches, not upstream.
 
 ---
 
 ## 2. Unknown-system answers are never remembered: `validateCode(Coding)` returns early past both the per-run memo and the cache
 
-**Where:** fhir-core `BaseWorkerContext.validateCode(Coding)`, master lines 1552-1567. When local evaluation of an unknown code system records a warning (a `VSCheckerException` with type `CODESYSTEM_UNSUPPORTED` becomes `localWarning`, lines 1470-1475) and the server then also answers `CODESYSTEM_UNSUPPORTED` with the code's system in `unknownSystems` (an `x-caused-by-unknown-system` response, parsed at 2139-2148), the "go with the local warning" branch rebuilds a WARNING `ValidationResult` from `localWarning` and **returns early** (lines 1557-1561) — skipping both `updateUnsupportedCodeSystems` (line 1563, the per-run negative memo) and `txCache.cacheValidation` (lines 1564-1566). The answer is recorded at no layer, so the next `validateCode` for the same system is a fresh server round trip — within the run, and again on every subsequent build.
+**Setup.** `BaseWorkerContext.validateCode(Coding)` (the five-arg overload at [BaseWorkerContext.java#L1429](https://github.com/hapifhir/org.hl7.fhir.core/blob/5c4d5a0ff3b66f26f1365bc8a3e32ad5c561a6f7/org.hl7.fhir.r5/src/main/java/org/hl7/fhir/r5/context/BaseWorkerContext.java#L1429)) tries local validation first, then asks the terminology server, and is supposed to remember negative answers in two layers: a per-run memo of unsupported code systems (`updateUnsupportedCodeSystems`) and the persistent terminology cache (`txCache.cacheValidation`). Spec example resources routinely use fictional code systems (`http://example.org/fhir/foo-types`, `http://acme.com/...`), so "this system is unknown" is one of the most-repeated answers in a build.
 
-A second, minor bug sits in the same lines: line 1560 composes diagnostics as `"Local Warning: " + localWarning + ". Server Error: " + res.getMessage()` — but `res` was just reassigned at line 1559, so the "Server Error:" text is the local warning repeated and the server's actual message is discarded. (The comment at 1558 also says "local error" where it means the local warning.)
+**The bug.** When local evaluation of an unknown system records a warning (a `VSCheckerException` of type `CODESYSTEM_UNSUPPORTED` becomes `localWarning`, [L1470-L1475](https://github.com/hapifhir/org.hl7.fhir.core/blob/5c4d5a0ff3b66f26f1365bc8a3e32ad5c561a6f7/org.hl7.fhir.r5/src/main/java/org/hl7/fhir/r5/context/BaseWorkerContext.java#L1470-L1475)) and the server then also answers `CODESYSTEM_UNSUPPORTED` with the code's system in `unknownSystems`, the "go with the local warning" branch rebuilds a WARNING `ValidationResult` and **returns early** — skipping both the per-run memo (line 1563) and the cache write (lines 1564-1566):
 
-**Symptom:** Every coding from an unknown/fictional system (`http://example.org/fhir/foo-types`, `http://acme.com/...` — common in spec example resources) round-trips to the server on every occurrence. We counted **22 separate POSTs for one fictional system** in one build. Narrative generation makes this unbounded: `DataRenderer.lookupCode` (master DataRenderer.java 313-323) calls `validateCode(options, system, version, code, null)` → `validateCode(Coding, vs=null)` (BaseWorkerContext 1181-1186) with useClient and useServer both on, so every rendered example mentioning the system pays a round trip, every build, forever. Compounding: the CodeableConcept validation path (master 1723-1816) neither consults nor updates the memo at all, and versioned codings are excluded from memoization (lines 1702-1706, `!code.hasVersion()`).
+https://github.com/hapifhir/org.hl7.fhir.core/blob/5c4d5a0ff3b66f26f1365bc8a3e32ad5c561a6f7/org.hl7.fhir.r5/src/main/java/org/hl7/fhir/r5/context/BaseWorkerContext.java#L1557-L1567
 
-Related asymmetry worth fixing at the same time: `processValidationResult` treats the two unknown-system response spellings differently — `x-caused-by-unknown-system` classifies the result as `CODESYSTEM_UNSUPPORTED` (2139-2148), while `x-unknown-system` only populates `unknownSystems` and never sets the error class (2149-2150) — so a server using the latter spelling can never arm the memo by any path. Current tx.fhir.org returns `x-caused-by-unknown-system` for both the CodeSystem and ValueSet `$validate-code` shapes (verified live, June 2026), so on that server the early return above is the operative bug.
+```java
+    } else if (!res.isOk() && res.getErrorClass() == TerminologyServiceErrorClass.CODESYSTEM_UNSUPPORTED && res.getUnknownSystems() != null && res.getUnknownSystems().contains(codeKey) && localWarning != null) {
+      // we had some problem evaluating locally, but the server doesn't know the code system, so we'll just go with the local error
+      res = new ValidationResult(IssueSeverity.WARNING, localWarning, null);
+      res.setDiagnostics("Local Warning: " + localWarning.trim() + ". Server Error: " + res.getMessage());
+      return res;
+    }
+    updateUnsupportedCodeSystems(res, code, codeKey);
+    if (cachingAllowed && txCache != null) { // we never cache unsupported code systems - we always keep trying (but only once per run)
+      txCache.cacheValidation(cacheToken, res, TerminologyCache.PERMANENT);
+    }
+    return res;
+```
 
-**Repro:** With a context configured with a terminology server and a tx cache, call `validateCode(new ValidationOptions(), new Coding().setSystem("http://example.org/fhir/foo-types").setCode("xyz"), null)` twice (useClient/useServer at their defaults, vs = null): the tx log shows two identical `$validate-code` round trips and nothing is written to the tx cache. Equivalently, validate any resource containing a coding from a made-up system twice, or grep a cold build's server log for `example.org` request counts.
+The answer is recorded at no layer, so the next `validateCode` for the same system is a fresh server round trip — within the run, and again on every subsequent build. A second, minor bug sits in the same lines: the `setDiagnostics` call composes `"Local Warning: " + localWarning + ". Server Error: " + res.getMessage()` — but `res` was just reassigned on the previous line, so the "Server Error:" text is the local warning repeated and the server's actual message is discarded. (The comment also says "local error" where it means the local warning.)
 
-**Status:** Client-side workaround (local synthesis of unknown-system answers, byte-identical to 11/11 captured server responses) on branch `spike/core-localfirst` (`-Dorg.hl7.fhir.tx.localFirst`). Fix direction upstream: arm the memo and cache the rebuilt warning result before returning, and compose the diagnostics string from the server result's message rather than the rebuilt one's.
+A related asymmetry worth fixing at the same time: `processValidationResult` ([L2105](https://github.com/hapifhir/org.hl7.fhir.core/blob/5c4d5a0ff3b66f26f1365bc8a3e32ad5c561a6f7/org.hl7.fhir.r5/src/main/java/org/hl7/fhir/r5/context/BaseWorkerContext.java#L2105)) treats the two unknown-system response spellings differently — `x-caused-by-unknown-system` sets the error class to `CODESYSTEM_UNSUPPORTED`, while `x-unknown-system` only populates `unknownSystems` and never sets the error class — so a server using the latter spelling can never arm the memo by any path:
+
+https://github.com/hapifhir/org.hl7.fhir.core/blob/5c4d5a0ff3b66f26f1365bc8a3e32ad5c561a6f7/org.hl7.fhir.r5/src/main/java/org/hl7/fhir/r5/context/BaseWorkerContext.java#L2139-L2150
+
+```java
+        } else if (p.getName().equals("x-caused-by-unknown-system")) {
+          String unkSystem = ((PrimitiveType<?>) p.getValue()).asStringValue();
+          if (unkSystem != null && unkSystem.contains("|")) {
+            err = TerminologyServiceErrorClass.CODESYSTEM_UNSUPPORTED_VERSION;
+            system = unkSystem.substring(0, unkSystem.indexOf("|"));
+            version = unkSystem.substring(unkSystem.indexOf("|") + 1);
+          } else {
+            err = TerminologyServiceErrorClass.CODESYSTEM_UNSUPPORTED;
+            unknownSystems.add(unkSystem);
+          }
+        } else if (p.getName().equals("x-unknown-system")) {
+          unknownSystems.add(((PrimitiveType<?>) p.getValue()).asStringValue());
+```
+
+Current tx.fhir.org returns `x-caused-by-unknown-system` for both the CodeSystem and ValueSet `$validate-code` shapes (verified live, June 2026), so on that server the early return above is the operative bug.
+
+**Consequences.** Every coding from an unknown/fictional system round-trips to the server on every occurrence. We counted **22 separate POSTs for one fictional system** in one build. Narrative generation makes this unbounded: `DataRenderer.lookupCode` ([DataRenderer.java#L313-L323](https://github.com/hapifhir/org.hl7.fhir.core/blob/5c4d5a0ff3b66f26f1365bc8a3e32ad5c561a6f7/org.hl7.fhir.r5/src/main/java/org/hl7/fhir/r5/renderers/DataRenderer.java#L313-L323)) calls `validateCode(options, system, version, code, null)` → `validateCode(Coding, vs=null)` ([BaseWorkerContext.java#L1181-L1185](https://github.com/hapifhir/org.hl7.fhir.core/blob/5c4d5a0ff3b66f26f1365bc8a3e32ad5c561a6f7/org.hl7.fhir.r5/src/main/java/org/hl7/fhir/r5/context/BaseWorkerContext.java#L1181-L1185)) with useClient and useServer both on, so every rendered example mentioning the system pays a round trip, every build, forever. Compounding: the CodeableConcept validation path ([L1723-L1816](https://github.com/hapifhir/org.hl7.fhir.core/blob/5c4d5a0ff3b66f26f1365bc8a3e32ad5c561a6f7/org.hl7.fhir.r5/src/main/java/org/hl7/fhir/r5/context/BaseWorkerContext.java#L1723-L1816)) neither consults nor updates the memo at all, and versioned codings are excluded from memoization (`!code.hasVersion()` in `updateUnsupportedCodeSystems`, [L1702-L1706](https://github.com/hapifhir/org.hl7.fhir.core/blob/5c4d5a0ff3b66f26f1365bc8a3e32ad5c561a6f7/org.hl7.fhir.r5/src/main/java/org/hl7/fhir/r5/context/BaseWorkerContext.java#L1702-L1706)).
+
+**Repro.** With a context configured with a terminology server and a tx cache, call `validateCode(new ValidationOptions(), new Coding().setSystem("http://example.org/fhir/foo-types").setCode("xyz"), null)` twice (useClient/useServer at their defaults, vs = null): the tx log shows two identical `$validate-code` round trips and nothing is written to the tx cache. Equivalently, validate any resource containing a coding from a made-up system twice, or grep a cold build's server log for `example.org` request counts.
+
+**Status.** No upstream fix; a client-side workaround (local synthesis of unknown-system answers, byte-identical to 11/11 captured server responses) lives on the author's workspace branch `spike/core-localfirst` (gated by `-Dorg.hl7.fhir.tx.localFirst`). Suggested fix direction upstream: arm the memo and cache the rebuilt warning result before returning, and compose the diagnostics string from the server result's message rather than the rebuilt one's.
 
 ---
 
 ## 3. Registry "no server claims this system" still falls back to asking the primary server
 
-**Where:** fhir-core `TerminologyClientManager.chooseServer` (master lines 288-316: "System not handled by any servers. Using primary server") and `decideWhichServer` (lines 426-469): a clean registry negative (resolve succeeds with no `authoritative` and no `candidates`) returns an empty `ServerOptionList` (452-460), which `chooseServer` then turns into a POST to the primary server; the resolve-error path falls back to the primary the same way (461-468).
+**Setup:** fhir-core routes terminology requests through `TerminologyClientManager`, which asks the tx ecosystem registry (`resolve?...&url=<system>`) which server is authoritative for each code system, then picks a server in `chooseServer(ValueSet, Set<String>, boolean)`. The registry can answer with authoritative servers, candidate servers, or — for unknown/fictional systems — neither.
 
-**Symptom:** A clean negative answer from the tx ecosystem registry (no authoritative server, no candidates) produces a positive network action — a `$validate-code` POST to the primary server, which then also fails. Negative routing knowledge is discarded.
+**The bug:** A clean registry negative (the resolve call succeeds but returns no `authoritative` and no `candidates` entries) is encoded as an empty `ServerOptionList`, indistinguishable in effect from "no information":
 
-**Repro:** Same as #2 — fictional-system validations; observe the registry resolve GET followed anyway by a primary-server POST.
+https://github.com/hapifhir/org.hl7.fhir.core/blob/5c4d5a0ff3b66f26f1365bc8a3e32ad5c561a6f7/org.hl7.fhir.r5/src/main/java/org/hl7/fhir/r5/terminologies/client/TerminologyClientManager.java#L451-L460
 
-**Status:** Addressed as part of `spike/core-localfirst`. Worth an upstream design note regardless.
+```java
+    try {
+      ServerOptionList ret = new ServerOptionList(url);
+      JsonObject json = JsonParser.parseObjectFromUrl(request);
+      for (JsonObject item : json.getJsonObjects("authoritative")) {
+          ret.authoritative.add(item.asString("url"));
+      }
+      for (JsonObject item : json.getJsonObjects("candidates")) {
+        ret.candidates.add(item.asString("url"));
+      }
+      return ret;
+```
+
+`chooseServer` then falls through all of its matching loops (authoritative-for-all, partially-authoritative, candidate-for-all, most-authoritative — they iterate empty lists) and lands in the catch-all fallback, which turns the negative into a `$validate-code` POST to the primary server:
+
+https://github.com/hapifhir/org.hl7.fhir.core/blob/5c4d5a0ff3b66f26f1365bc8a3e32ad5c561a6f7/org.hl7.fhir.r5/src/main/java/org/hl7/fhir/r5/terminologies/client/TerminologyClientManager.java#L308-L316
+
+```java
+    } else {
+      if (systems.size() == 1) {
+        log(vs, serverList.get(0).getAddress(), systems, choices, "System not handled by any servers. Using primary server");
+      } else {
+        log(vs, serverList.get(0).getAddress(), systems, choices, "Systems handled by multiple servers. Using primary server");
+      }
+      log(vs, serverList.get(0).getAddress(), systems, choices, "Fallback: primary server");
+      return findClient(serverList.get(0).getAddress(), systems, expand);
+    }
+```
+
+(The `vs != null` branch at [L300-L307](https://github.com/hapifhir/org.hl7.fhir.core/blob/5c4d5a0ff3b66f26f1365bc8a3e32ad5c561a6f7/org.hl7.fhir.r5/src/main/java/org/hl7/fhir/r5/terminologies/client/TerminologyClientManager.java#L300-L307) does the same.) The resolve-*error* path falls back to the primary the same way, returning `new ServerOptionList(url, getMasterClient().getAddress())` at [L461-L468](https://github.com/hapifhir/org.hl7.fhir.core/blob/5c4d5a0ff3b66f26f1365bc8a3e32ad5c561a6f7/org.hl7.fhir.r5/src/main/java/org/hl7/fhir/r5/terminologies/client/TerminologyClientManager.java#L461-L468) — so "registry definitively says nobody serves this system" and "registry unreachable" produce identical behavior.
+
+**Consequences:** A clean negative answer from the tx ecosystem registry (no authoritative server, no candidates) produces a positive network action — a `$validate-code` POST to the primary server, which then also fails. Negative routing knowledge is discarded. Combined with bug #2 (unknown-system answers never memoized or cached), every validation of a coding from an unknown system pays both the registry resolve and the doomed primary-server POST.
+
+**Repro:** Same as #2 — validate codings from a fictional system (e.g. `http://example.org/fhir/foo-types`); in the tx log, observe the registry resolve GET followed anyway by a primary-server `$validate-code` POST.
+
+**Status:** Addressed as part of the author's workspace branch `spike/core-localfirst`. Worth an upstream design note regardless.
 
 ---
 
 ## 4. Terminology stack is not thread-safe; failures silently disable terminology and corrupt results
 
-**Where:** fhir-core:
-- `TerminologyCache.cacheCodeSystem` / `cacheValueSet` (master lines 1304-1370): plain `HashMap`s (`csCache`/`vsCache`, lines 347-348) mutated and iterated with no synchronization. Observed live `ConcurrentModificationException` at `TerminologyCache.cacheCodeSystem:1170` under 12-thread validation (line number from the 6.9.1 line; the method is at ~1341 in master). Master's June 2026 txcache rework (df9504f6e) added a TODO comment (lines 87-97) acknowledging exactly these unsynchronized paths — `getServerId`, `cacheValueSet`/`cacheCodeSystem`, `getReport` — but the races remain.
-- `TerminologyClientManager`: `resMap`/`serverMap` plain HashMaps (lines 142/144) mutated by concurrent `chooseServer` → `findClient`/`findServerForSystem` (385-415).
-- The killer: `BaseWorkerContext.getTxSupportInfo` (master 817-862) wraps the server-support probe in `catch (Exception)` (839) → **sets `noTerminologyServer=true`** (841) whenever `canRunWithoutTerminology` is set (kindling sets it for all non-web builds, Publisher.java:2482). A console banner is printed, but the build continues with terminology permanently disabled → every subsequent batch validation returns NOSERVICE → `ConceptMapValidator` renders those as `CONCEPTMAP_VS_INVALID_CONCEPT_CODE` errors. One swallowed race produced **217-220 bogus validation errors** ("The code 'X' in the system http://snomed.info/sct is not valid in the value set 'null'"), timing-dependent (some runs clean, some corrupted, same inputs).
+**Setup.** During a spec build, validation threads share one `BaseWorkerContext`, which owns the terminology disk cache (`TerminologyCache`) and the multi-server client routing layer (`TerminologyClientManager`). Most of `TerminologyCache` synchronizes on a shared lock object, but several mutating paths do not, and the shared client-routing maps have no synchronization at all — so running validation across a thread pool exercises live data races.
 
-**Repro:** Run example validation across a thread pool sharing one `BaseWorkerContext` with a cold terminology cache (branch `spike/s3-parallel-validation` against unfixed core reproduces within a few runs).
+**The bug.** Three layers, in increasing severity:
 
-**Status:** Fixed in PR branch `perf/tx-thread-safety` (commit a4030ee0a): synchronization, COW server list, narrowed catch, NOSERVICE downgrade in ConceptMapValidator.
+1. *Unsynchronized cache maps.* `csCache`/`vsCache` are plain `HashMap`s, mutated and then fully iterated (to rewrite `cs-externals.json`/`vs-externals.json`) with no lock — `cacheValueSet`/`cacheCodeSystem` at [TerminologyCache.java#L1304-L1376](https://github.com/hapifhir/org.hl7.fhir.core/blob/5c4d5a0ff3b66f26f1365bc8a3e32ad5c561a6f7/org.hl7.fhir.r5/src/main/java/org/hl7/fhir/r5/terminologies/utilities/TerminologyCache.java#L1304-L1376). A live `ConcurrentModificationException` was observed at `TerminologyCache.cacheCodeSystem:1170` under 12-thread validation (line number from the 6.9.1 line; the method starts at line 1341 in master). Master's June 2026 txcache rework (df9504f6e) added a TODO acknowledging exactly these unsynchronized paths — `getServerId`, `cacheValueSet`/`cacheCodeSystem`, `getReport` — but the races remain:
+
+https://github.com/hapifhir/org.hl7.fhir.core/blob/5c4d5a0ff3b66f26f1365bc8a3e32ad5c561a6f7/org.hl7.fhir.r5/src/main/java/org/hl7/fhir/r5/terminologies/utilities/TerminologyCache.java#L346-L348
+```java
+  private Map<String, NamedCache> caches = new HashMap<String, NamedCache>();
+  private Map<String, SourcedValueSetEntry> vsCache = new HashMap<>();
+  private Map<String, SourcedCodeSystemEntry> csCache = new HashMap<>();
+```
+(TODO comment: [TerminologyCache.java#L87-L97](https://github.com/hapifhir/org.hl7.fhir.core/blob/5c4d5a0ff3b66f26f1365bc8a3e32ad5c561a6f7/org.hl7.fhir.r5/src/main/java/org/hl7/fhir/r5/terminologies/utilities/TerminologyCache.java#L87-L97).)
+
+2. *Unsynchronized client routing.* `TerminologyClientManager`'s `serverMap`/`resMap` are plain `HashMap`s ([declarations, L142-L144](https://github.com/hapifhir/org.hl7.fhir.core/blob/5c4d5a0ff3b66f26f1365bc8a3e32ad5c561a6f7/org.hl7.fhir.r5/src/main/java/org/hl7/fhir/r5/terminologies/client/TerminologyClientManager.java#L142-L144)) mutated by concurrent `chooseServer` → `findClient`/`findServerForSystem` ([L385-L415](https://github.com/hapifhir/org.hl7.fhir.core/blob/5c4d5a0ff3b66f26f1365bc8a3e32ad5c561a6f7/org.hl7.fhir.r5/src/main/java/org/hl7/fhir/r5/terminologies/client/TerminologyClientManager.java#L385-L415)).
+
+3. *The killer: any exception silently kills terminology for the rest of the build.* `BaseWorkerContext.getTxSupportInfo` ([L817-L862](https://github.com/hapifhir/org.hl7.fhir.core/blob/5c4d5a0ff3b66f26f1365bc8a3e32ad5c561a6f7/org.hl7.fhir.r5/src/main/java/org/hl7/fhir/r5/context/BaseWorkerContext.java#L817-L862)) wraps the server-support probe in `catch (Exception)` and, whenever `canRunWithoutTerminology` is set, flips `noTerminologyServer=true` and keeps going:
+
+https://github.com/hapifhir/org.hl7.fhir.core/blob/5c4d5a0ff3b66f26f1365bc8a3e32ad5c561a6f7/org.hl7.fhir.r5/src/main/java/org/hl7/fhir/r5/context/BaseWorkerContext.java#L839-L848
+```java
+            } catch (Exception e) {
+              if (canRunWithoutTerminology) {
+                noTerminologyServer = true;
+                logger.logMessage("==============!! Running without terminology server !! ==============");
+                if (terminologyClientManager.getMasterClient() != null) {
+                  logger.logMessage("txServer = " + terminologyClientManager.getMasterClient().getId());
+                  logger.logMessage("Error = " + e.getMessage() + "");
+                }
+                logger.logMessage("=====================================================================");
+                return new SystemSupportInformation(false);
+```
+
+kindling sets `canRunWithoutTerminology` for all non-web builds ([Publisher.java#L2482](https://github.com/HL7/kindling/blob/b6cb1f66e49ac8ef4ace2932ad5345cb3e5624d8/src/main/java/org/hl7/fhir/tools/publisher/Publisher.java#L2482)), so any race-induced exception from layers 1-2 is swallowed here. A console banner is printed, but the build continues with terminology permanently disabled: every subsequent batch validation returns NOSERVICE, and `ConceptMapValidator` renders NOSERVICE results as hard `CONCEPTMAP_VS_INVALID_CONCEPT_CODE` errors ([ConceptMapValidator.java#L206-L215](https://github.com/hapifhir/org.hl7.fhir.core/blob/5c4d5a0ff3b66f26f1365bc8a3e32ad5c561a6f7/org.hl7.fhir.validation/src/main/java/org/hl7/fhir/validation/instance/type/ConceptMapValidator.java#L206-L215) — only `CODESYSTEM_UNSUPPORTED`/`_VERSION` are downgraded to warnings; NOSERVICE falls through to the error branch).
+
+**Consequences.** One swallowed race silently corrupts build output rather than failing it: a single observed occurrence produced **217-220 bogus validation errors** of the form "The code 'X' in the system http://snomed.info/sct is not valid in the value set 'null'". The corruption is timing-dependent — some runs clean, some corrupted, same inputs — which makes it look like flaky terminology data rather than a thread-safety bug.
+
+**Repro.** Run example validation across a thread pool sharing one `BaseWorkerContext` with a cold terminology cache. The author's kindling workspace branch `spike/s3-parallel-validation` run against unfixed core reproduces within a few runs.
+
+**Status.** Fixed in the author's workspace PR branch [`perf/tx-thread-safety`](https://github.com/jmandel/org.hl7.fhir.core/tree/perf/tx-thread-safety) (fhir-core fork, commit a4030ee0a): synchronization, copy-on-write server list, narrowed catch, and a NOSERVICE downgrade in `ConceptMapValidator`.
 
 ---
 
 ## 5. `BaseWorkerContext` and `TerminologyCache` share one lock; whole cache-page file rewrites happen under it
 
-**Where:** fhir-core `BaseWorkerContext` line 260 declares `private final Object lock`; `initTxCache` (lines 2244-2246) passes it into `new TerminologyCache(lock, cachePath)` (constructor at TerminologyCache.java:385). `TerminologyCache.cacheValidation` → `store()` → `save(nc)` (lines 768-778, 696-728, 820) rewrites an entire named cache page (~110KB/entry for SNOMED because each entry embeds the serialized ValueSet; ~4.9GB cumulative writes in one cold build) **while holding that shared lock**.
+**Setup.** `BaseWorkerContext` is fhir-core's central resource/terminology context, and it guards essentially all of its state — resource maps, code systems, value sets — with a single private monitor object. `TerminologyCache` is the disk-backed cache of terminology-server answers, persisted as one "page" file per named cache (e.g. one file per code system). The context hands its own lock to the cache at construction time, so the two components serialize on the same monitor.
 
-**Symptom (JFR-measured):** During 12-thread validation, 593 seconds of monitor-blocking in a 67-second window — **74% of all validator thread-time** queued behind one lock, mostly `fetchResourceWithExceptionByVersion` waiting for cache file I/O.
+**The bug.** The context's lock ([BaseWorkerContext.java#L260](https://github.com/hapifhir/org.hl7.fhir.core/blob/5c4d5a0ff3b66f26f1365bc8a3e32ad5c561a6f7/org.hl7.fhir.r5/src/main/java/org/hl7/fhir/r5/context/BaseWorkerContext.java#L260)) is passed straight into the cache:
 
-**Repro:** JFR `jdk.JavaMonitorEnter` on any multi-threaded validation workload.
+https://github.com/hapifhir/org.hl7.fhir.core/blob/5c4d5a0ff3b66f26f1365bc8a3e32ad5c561a6f7/org.hl7.fhir.r5/src/main/java/org/hl7/fhir/r5/context/BaseWorkerContext.java#L2244-L2249
+```java
+  public void initTxCache(String cachePath) throws FileNotFoundException, FHIRException, IOException {
+    if (cachePath != null) {
+      txCache = new TerminologyCache(lock, cachePath);
+      initTxCache(txCache);
+    }
+  }
+```
 
-**Status:** Fixed in `perf/tx-thread-safety` (lock split; cache is self-synchronized leaf). Master had independently improved persistence (5s save coalescing) but still shared the lock.
+(the receiving constructor is explicit about it — `// use lock from the context`, [TerminologyCache.java#L384-L387](https://github.com/hapifhir/org.hl7.fhir.core/blob/5c4d5a0ff3b66f26f1365bc8a3e32ad5c561a6f7/org.hl7.fhir.r5/src/main/java/org/hl7/fhir/r5/terminologies/utilities/TerminologyCache.java#L384-L387)).
+
+The cache then does disk I/O while holding that shared lock. `cacheValidation` takes the lock and calls `store(...)`:
+
+https://github.com/hapifhir/org.hl7.fhir.core/blob/5c4d5a0ff3b66f26f1365bc8a3e32ad5c561a6f7/org.hl7.fhir.r5/src/main/java/org/hl7/fhir/r5/terminologies/utilities/TerminologyCache.java#L768-L779
+```java
+  public void cacheValidation(CacheToken cacheToken, ValidationResult res, boolean persistent) {
+    if (cacheToken.key != null) {
+      synchronized (lock) {      
+        NamedCache nc = getNamedCache(cacheToken);
+        CacheEntry e = new CacheEntry();
+        e.request = cacheToken.request;
+        e.persistent = persistent;
+        e.v = new ValidationResult(res);
+        store(cacheToken, persistent, nc, e);
+      }    
+    }
+  }
+```
+
+`store` ([L696-L728](https://github.com/hapifhir/org.hl7.fhir.core/blob/5c4d5a0ff3b66f26f1365bc8a3e32ad5c561a6f7/org.hl7.fhir.r5/src/main/java/org/hl7/fhir/r5/terminologies/utilities/TerminologyCache.java#L696-L728)) calls `save(nc, now)` ([L820](https://github.com/hapifhir/org.hl7.fhir.core/blob/5c4d5a0ff3b66f26f1365bc8a3e32ad5c561a6f7/org.hl7.fhir.r5/src/main/java/org/hl7/fhir/r5/terminologies/utilities/TerminologyCache.java#L820-L829)), which rewrites the **entire** named cache page file — every entry, each embedding its serialized ValueSet — still inside the shared monitor. For SNOMED that is ~110KB per entry, and ~4.9GB of cumulative writes over one cold build. Meanwhile every other context operation (resource fetches, code-system lookups) is queued behind the same lock waiting for that file I/O.
+
+**Consequences.** JFR-measured during 12-thread validation: 593 seconds of monitor-blocking inside a 67-second wall-clock window — **74% of all validator thread-time** queued behind this one lock, mostly threads in `fetchResourceWithExceptionByVersion` waiting for cache file I/O.
+
+**Repro.** Record JFR with `jdk.JavaMonitorEnter` enabled on any multi-threaded validation workload; the blocked time concentrates on the `BaseWorkerContext` lock.
+
+**Status.** Fixed in the author's workspace branch [`perf/tx-thread-safety`](https://github.com/jmandel/org.hl7.fhir.core/tree/perf/tx-thread-safety) (lock split; the cache becomes a self-synchronized leaf). Upstream master had independently improved persistence — saves are now coalesced into 5s windows (`SAVE_DELAY_MS = 5000`, [L185](https://github.com/hapifhir/org.hl7.fhir.core/blob/5c4d5a0ff3b66f26f1365bc8a3e32ad5c561a6f7/org.hl7.fhir.r5/src/main/java/org/hl7/fhir/r5/terminologies/utilities/TerminologyCache.java#L185)) — but the lock is still shared.
 
 ---
 
 ## 6. Transient server errors are cached permanently in the terminology disk cache
 
-**Where:** fhir-core — server-error outcomes ("Error from http://tx.fhir.org/r5: 404 Not Found nginx", "Error performing tx5 operation...") are stored as PERMANENT cache entries like any other result. `BaseWorkerContext.validateCode` caches every server outcome PERMANENT (master 1546-1566 for Coding — including results synthesized from transport exceptions, which get errorClass SERVER_ERROR at 1550 — and 1802-1814 for CodeableConcept), and `TerminologyCache.store` (696-728) filters only unversioned CODESYSTEM_UNSUPPORTED results, never transport/5xx/404 outcomes.
+**Setup.** fhir-core memoizes terminology-server answers in a disk cache (`~/.fhir/tx-cache/...`) so warm builds can skip `$validate-code` round trips. Cache entries are written by `BaseWorkerContext.validateCode` with a lifetime flag; `TerminologyCache.store` is the single choke point that decides whether an entry is persisted.
 
-**Symptom:** A build that runs during a transient server flake poisons `~/.fhir/tx-cache/...`: subsequent **warm** builds replay the cached error as a validation failure forever. We reproduced a build that passes cold and then fails warm *from its own priming run's cached errors*; found 10 poisoned `.cache` files after one flaky afternoon.
+**The bug.** Server-error outcomes — "Error from http://tx.fhir.org/r5: 404 Not Found nginx", "Error performing tx5 operation..." — are stored as PERMANENT cache entries exactly like real answers. On the Coding path, any transport exception is converted into an ERROR `ValidationResult` with errorClass `SERVER_ERROR`:
 
-**Repro:** `grep -l "Error performing tx5\|Error from http" ~/.fhir/tx-cache/*/*/*/*.cache` after any build that overlapped a server hiccup; rerun warm and watch rc=1.
+https://github.com/hapifhir/org.hl7.fhir.core/blob/5c4d5a0ff3b66f26f1365bc8a3e32ad5c561a6f7/org.hl7.fhir.r5/src/main/java/org/hl7/fhir/r5/context/BaseWorkerContext.java#L1546-L1551
+```java
+    try {
+      Parameters pIn = constructParameters(options, code);
+      res = validateOnServer2(tc, vs, pIn, options, systems);
+    } catch (Exception e) {
+      res = new ValidationResult(IssueSeverity.ERROR, e.getMessage() == null ? e.getClass().getName() : e.getMessage(), null).setTxLink(txLog == null ? null : txLog.getLastId()).setErrorClass(TerminologyServiceErrorClass.SERVER_ERROR);
+    }
+```
 
-**Fix direction:** Never persist results whose message indicates a transport/5xx/404 failure (or persist with a transient TTL).
+That `res` flows straight into `txCache.cacheValidation(cacheToken, res, TerminologyCache.PERMANENT)` a few lines later ([L1564-L1566](https://github.com/hapifhir/org.hl7.fhir.core/blob/5c4d5a0ff3b66f26f1365bc8a3e32ad5c561a6f7/org.hl7.fhir.r5/src/main/java/org/hl7/fhir/r5/context/BaseWorkerContext.java#L1564-L1566)); the CodeableConcept path does the same ([L1802-L1814](https://github.com/hapifhir/org.hl7.fhir.core/blob/5c4d5a0ff3b66f26f1365bc8a3e32ad5c561a6f7/org.hl7.fhir.r5/src/main/java/org/hl7/fhir/r5/context/BaseWorkerContext.java#L1802-L1814)). The only outcome `TerminologyCache.store` ever filters is an unversioned `CODESYSTEM_UNSUPPORTED` — transport failures, 5xx, and 404 results pass through and are persisted:
 
-**Status:** Report-only (our builds purge manually; `runs/bench.sh` has a poison-check).
+https://github.com/hapifhir/org.hl7.fhir.core/blob/5c4d5a0ff3b66f26f1365bc8a3e32ad5c561a6f7/org.hl7.fhir.r5/src/main/java/org/hl7/fhir/r5/terminologies/utilities/TerminologyCache.java#L696-L706
+```java
+  public void store(CacheToken cacheToken, boolean persistent, NamedCache nc, CacheEntry e) {
+    if (noCaching) {
+      return;
+    }
+
+    if ( !cacheErrors &&
+        ( e.v!= null
+        && e.v.getErrorClass() == TerminologyServiceErrorClass.CODESYSTEM_UNSUPPORTED
+        && !cacheToken.hasVersion)) {
+      return;
+    }
+```
+
+**Consequences.** A build that runs during a transient server flake poisons `~/.fhir/tx-cache/...`: subsequent **warm** builds replay the cached error as a validation failure forever, until someone manually deletes the cache files. We reproduced a build that passes cold and then fails warm *from its own priming run's cached errors*, and found 10 poisoned `.cache` files after one flaky afternoon.
+
+**Repro.** Run any build that overlaps a server hiccup, then:
+```
+grep -l "Error performing tx5\|Error from http" ~/.fhir/tx-cache/*/*/*/*.cache
+```
+Rerun the build warm and watch it exit rc=1 on the replayed errors.
+
+**Fix direction.** Never persist results whose message indicates a transport/5xx/404 failure (or persist them with a transient TTL).
+
+**Status.** Report-only — no fix branch. The author's workspace builds purge poisoned entries manually, and the workspace harness (`runs/bench.sh`) includes a poison-check.
 
 ---
 
 ## 7. `validateCodeBatch` returns degraded results vs singular validation
 
-**Where:** fhir-core `BaseWorkerContext.validateCodeBatch` (master 1205-1293) vs the singular `validateOnServer2`/`addServerValidationParameters` path (1893-1980). The batch request omits, relative to singular: `addDependentResources` (referenced ValueSets, COMPLETE/FRAGMENT CodeSystems, supplements as `tx-resource` — 1946), `cache-id` bookkeeping (1953), `valueSetVersion` (1931; batch sends only `url`, 1261), correct expansion-parameter merge semantics (`defaultDisplayLanguage` translation, override order — 1962-1974; batch dumps the raw expansion parameters into each sub-request, 1698), `mode=lenient-display-validation` (1977), and `diagnostics=true` (1979); the response path passes `null` instead of the VS url to `processValidationResult` (1284) and never updates the unsupported-systems memo.
+**Setup.** `BaseWorkerContext` has two paths for asking a terminology server to validate a coding: the singular path ([`validateOnServer2` → `addServerValidationParameters`](https://github.com/hapifhir/org.hl7.fhir.core/blob/5c4d5a0ff3b66f26f1365bc8a3e32ad5c561a6f7/org.hl7.fhir.r5/src/main/java/org/hl7/fhir/r5/context/BaseWorkerContext.java#L1893-L1980)), which carefully assembles the request, and the batch path ([`validateCodeBatch`](https://github.com/hapifhir/org.hl7.fhir.core/blob/5c4d5a0ff3b66f26f1365bc8a3e32ad5c561a6f7/org.hl7.fhir.r5/src/main/java/org/hl7/fhir/r5/context/BaseWorkerContext.java#L1205-L1293)), which packs many codings into one `$batch` request. The two are supposed to be equivalent; they are not.
 
-**Symptom:** Identical codes validated via the batch path yield fewer/weaker messages — a full spec build validated via batch prefill lost **~650 warnings** (3693→3037), silently.
+**The bug.** The batch path hand-rolls its request and response handling instead of reusing `addServerValidationParameters`/the singular result path, and omits seven things the singular path does. On the request side, the batch attaches the ValueSet with only a bare `url`:
 
-**Repro:** Validate the same coded elements through both paths and diff messages; or see the reconciliation commit `fe25b5e3d` on `spike/core-batch-tx`, which enumerates and fixes all seven gaps.
+https://github.com/hapifhir/org.hl7.fhir.core/blob/5c4d5a0ff3b66f26f1365bc8a3e32ad5c561a6f7/org.hl7.fhir.r5/src/main/java/org/hl7/fhir/r5/context/BaseWorkerContext.java#L1257-L1262
+```java
+    if (vs != null) {
+      if (passVS) {
+        batch.addParameter().setName("tx-resource").setResource(vs);
+      }
+      batch.addParameter("url", vs.getUrl());
+    }
+```
 
-**Status:** Fix exists on `spike/core-batch-tx` (not in the main PR branches; the two-pass feature that motivated it is parked). The gap matters to every current consumer of `validateCodeBatch`: `ConceptMapValidator` (line 204), the validator's `ValueSetValidator` (line 520), and `CodingsObserver` IPS checks (line 105).
+and on the response side it passes `null` instead of the ValueSet url into `processValidationResult` (the singular path passes `vs.getUrl()` at [L1918](https://github.com/hapifhir/org.hl7.fhir.core/blob/5c4d5a0ff3b66f26f1365bc8a3e32ad5c561a6f7/org.hl7.fhir.r5/src/main/java/org/hl7/fhir/r5/context/BaseWorkerContext.java#L1918)):
+
+https://github.com/hapifhir/org.hl7.fhir.core/blob/5c4d5a0ff3b66f26f1365bc8a3e32ad5c561a6f7/org.hl7.fhir.r5/src/main/java/org/hl7/fhir/r5/context/BaseWorkerContext.java#L1283-L1287
+```java
+        if (r.getResource() instanceof Parameters) {
+          t.setResult(processValidationResult((Parameters) r.getResource(), null, tc.getAddress()));
+          if (txCache != null) {
+            txCache.cacheValidation(t.getCacheToken(), t.getResult(), TerminologyCache.PERMANENT);
+          }
+```
+
+The full list of gaps, batch relative to singular:
+
+1. No dependent resources — referenced ValueSets, COMPLETE/FRAGMENT CodeSystems, and supplements attached as `tx-resource` by `addDependentResources` ([L1946](https://github.com/hapifhir/org.hl7.fhir.core/blob/5c4d5a0ff3b66f26f1365bc8a3e32ad5c561a6f7/org.hl7.fhir.r5/src/main/java/org/hl7/fhir/r5/context/BaseWorkerContext.java#L1946)).
+2. No `cache-id` bookkeeping ([L1953](https://github.com/hapifhir/org.hl7.fhir.core/blob/5c4d5a0ff3b66f26f1365bc8a3e32ad5c561a6f7/org.hl7.fhir.r5/src/main/java/org/hl7/fhir/r5/context/BaseWorkerContext.java#L1953)).
+3. No `valueSetVersion` ([L1930-L1932](https://github.com/hapifhir/org.hl7.fhir.core/blob/5c4d5a0ff3b66f26f1365bc8a3e32ad5c561a6f7/org.hl7.fhir.r5/src/main/java/org/hl7/fhir/r5/context/BaseWorkerContext.java#L1930-L1932)) — batch sends only `url` ([L1261](https://github.com/hapifhir/org.hl7.fhir.core/blob/5c4d5a0ff3b66f26f1365bc8a3e32ad5c561a6f7/org.hl7.fhir.r5/src/main/java/org/hl7/fhir/r5/context/BaseWorkerContext.java#L1261), excerpt above).
+4. Wrong expansion-parameter merge semantics — singular translates `defaultDisplayLanguage` and respects override order ([L1962-L1974](https://github.com/hapifhir/org.hl7.fhir.core/blob/5c4d5a0ff3b66f26f1365bc8a3e32ad5c561a6f7/org.hl7.fhir.r5/src/main/java/org/hl7/fhir/r5/context/BaseWorkerContext.java#L1962-L1974)); batch dumps the raw expansion parameters into each sub-request (`constructParameters`, [L1698](https://github.com/hapifhir/org.hl7.fhir.core/blob/5c4d5a0ff3b66f26f1365bc8a3e32ad5c561a6f7/org.hl7.fhir.r5/src/main/java/org/hl7/fhir/r5/context/BaseWorkerContext.java#L1698)).
+5. No `mode=lenient-display-validation` ([L1976-L1978](https://github.com/hapifhir/org.hl7.fhir.core/blob/5c4d5a0ff3b66f26f1365bc8a3e32ad5c561a6f7/org.hl7.fhir.r5/src/main/java/org/hl7/fhir/r5/context/BaseWorkerContext.java#L1976-L1978)).
+6. No `diagnostics=true` ([L1979](https://github.com/hapifhir/org.hl7.fhir.core/blob/5c4d5a0ff3b66f26f1365bc8a3e32ad5c561a6f7/org.hl7.fhir.r5/src/main/java/org/hl7/fhir/r5/context/BaseWorkerContext.java#L1979)).
+7. Response handling passes `null` instead of the VS url to `processValidationResult` ([L1284](https://github.com/hapifhir/org.hl7.fhir.core/blob/5c4d5a0ff3b66f26f1365bc8a3e32ad5c561a6f7/org.hl7.fhir.r5/src/main/java/org/hl7/fhir/r5/context/BaseWorkerContext.java#L1284), excerpt above) and never updates the unsupported-systems memo (`updateUnsupportedCodeSystems`, [L1702-L1706](https://github.com/hapifhir/org.hl7.fhir.core/blob/5c4d5a0ff3b66f26f1365bc8a3e32ad5c561a6f7/org.hl7.fhir.r5/src/main/java/org/hl7/fhir/r5/context/BaseWorkerContext.java#L1702-L1706)).
+
+**Consequences.** Identical codes validated via the batch path yield fewer/weaker messages than the singular path — a full spec build validated via batch prefill lost **~650 warnings** (3693→3037), silently. This affects every current consumer of `validateCodeBatch`: [`ConceptMapValidator` L204](https://github.com/hapifhir/org.hl7.fhir.core/blob/5c4d5a0ff3b66f26f1365bc8a3e32ad5c561a6f7/org.hl7.fhir.validation/src/main/java/org/hl7/fhir/validation/instance/type/ConceptMapValidator.java#L204), the validator's [`ValueSetValidator` L520](https://github.com/hapifhir/org.hl7.fhir.core/blob/5c4d5a0ff3b66f26f1365bc8a3e32ad5c561a6f7/org.hl7.fhir.validation/src/main/java/org/hl7/fhir/validation/instance/type/ValueSetValidator.java#L520), and [`CodingsObserver` IPS checks L105](https://github.com/hapifhir/org.hl7.fhir.core/blob/5c4d5a0ff3b66f26f1365bc8a3e32ad5c561a6f7/org.hl7.fhir.validation/src/main/java/org/hl7/fhir/validation/codesystem/CodingsObserver.java#L105).
+
+**Repro.** Validate the same coded elements through both paths and diff the resulting messages; or see the reconciliation commit `fe25b5e3d` on the author's workspace branch `spike/core-batch-tx`, which enumerates and fixes all seven gaps.
+
+**Status.** A fix exists on the author's workspace branch `spike/core-batch-tx` (commit `fe25b5e3d`); it is not in the main PR branches, and the two-pass feature that motivated it is parked. The gap matters to every current consumer of `validateCodeBatch` regardless (call sites linked above).
 
 ---
 
 ## 8. Hot-path allocation/CPU bugs: per-character varargs in `isWhitespace`; cache keys pretty-print full ValueSets per call
 
-**Where:** fhir-core:
-- `Utilities.isWhitespace` (master Utilities.java 1773-1777) called per character from `escapeJson` (1005-1031): allocates a 25-element varargs `int[]` (via `existsInList`) **per character**. JFR: 104GB of `int[]` allocation in one build (~half of a 3.1GB/s allocation storm).
-- `TerminologyCache.generateValidationToken` (master 491-585): pretty-print-serializes the expansion `Parameters` and the ValueSet "essence" on **every** `validateCode` call, including cache hits (the token is generated before the cache is consulted, BaseWorkerContext 1437-1440); ~73% of validation-phase CPU was JSON serialization for cache keys.
-- `JsonParserBase.compose` (lines 204, 258) uses an unbuffered `OutputStreamWriter` (per-token charset-encoder round trips; 34GB of HeapCharBuffer).
+**Setup:** Two utility paths in fhir-core sit directly under every JSON serialization and every terminology validation call: `Utilities.escapeJson` is invoked for each string written by the JSON composers, and `TerminologyCache.generateValidationToken` builds the cache key for each `validateCode` call. Both run millions of times in a spec build, so per-call waste here dominates the allocation and CPU profiles.
 
-**Repro:** JFR `jdk.ObjectAllocationSample` + `jdk.ExecutionSample` on any validation-heavy workload.
+**The bug:** Three independent hot-path defects, all in fhir-core:
 
-**Status:** Fixed in `perf/tx-thread-safety` (switch-based isWhitespace, memoized keys, buffered writers).
+1. `Utilities.isWhitespace` checks membership in a 25-element list via `existsInList(int, int...)`, which boxes the candidates into a fresh 25-element varargs `int[]` on **every call** — and `escapeJson` ([Utilities.java#L1004-L1030](https://github.com/hapifhir/org.hl7.fhir.core/blob/5c4d5a0ff3b66f26f1365bc8a3e32ad5c561a6f7/org.hl7.fhir.utilities/src/main/java/org/hl7/fhir/utilities/Utilities.java#L1004-L1030)) calls it once **per character** of every escaped string.
+
+https://github.com/hapifhir/org.hl7.fhir.core/blob/5c4d5a0ff3b66f26f1365bc8a3e32ad5c561a6f7/org.hl7.fhir.utilities/src/main/java/org/hl7/fhir/utilities/Utilities.java#L1773-L1777
+```java
+  public static boolean isWhitespace(int ch) {
+    return Utilities.existsInList(ch, '\\u0009', '\\n', '\\u000B','\\u000C','\\r','\\u0020','\\u0085','\\u00A0',
+        '\\u1680','\\u2000','\\u2001','\\u2002','\\u2003','\\u2004','\\u2005','\\u2006','\\u2007','\\u2008','\\u2009','\\u200A',
+        '\\u2028', '\\u2029', '\\u202F', '\\u205F', '\\u3000');
+  }
+```
+
+2. The `TerminologyCache.generateValidationToken` overloads ([TerminologyCache.java#L491-L580](https://github.com/hapifhir/org.hl7.fhir.core/blob/5c4d5a0ff3b66f26f1365bc8a3e32ad5c561a6f7/org.hl7.fhir.r5/src/main/java/org/hl7/fhir/r5/terminologies/utilities/TerminologyCache.java#L491-L580)) pretty-print-serialize the expansion `Parameters` — and, via `extracted(...)`/`getVSEssense(...)`, the ValueSet "essence" — to JSON on **every** `validateCode` call:
+
+https://github.com/hapifhir/org.hl7.fhir.core/blob/5c4d5a0ff3b66f26f1365bc8a3e32ad5c561a6f7/org.hl7.fhir.r5/src/main/java/org/hl7/fhir/r5/terminologies/utilities/TerminologyCache.java#L501-L503
+```java
+      JsonParser json = new JsonParser();
+      json.setOutputStyle(OutputStyle.PRETTY);
+      String expJS = expParameters == null ? "" : json.composeString(expParameters);
+```
+
+This cost is paid even on cache hits, because the token is generated before the cache is consulted ([BaseWorkerContext.java#L1437-L1441](https://github.com/hapifhir/org.hl7.fhir.core/blob/5c4d5a0ff3b66f26f1365bc8a3e32ad5c561a6f7/org.hl7.fhir.r5/src/main/java/org/hl7/fhir/r5/context/BaseWorkerContext.java#L1437-L1441)).
+
+3. `JsonParserBase.compose` wraps its output stream in an **unbuffered** `OutputStreamWriter` ([JsonParserBase.java#L204](https://github.com/hapifhir/org.hl7.fhir.core/blob/5c4d5a0ff3b66f26f1365bc8a3e32ad5c561a6f7/org.hl7.fhir.r5/src/main/java/org/hl7/fhir/r5/formats/JsonParserBase.java#L204) and [#L258](https://github.com/hapifhir/org.hl7.fhir.core/blob/5c4d5a0ff3b66f26f1365bc8a3e32ad5c561a6f7/org.hl7.fhir.r5/src/main/java/org/hl7/fhir/r5/formats/JsonParserBase.java#L258)), so every token round-trips through the charset encoder individually.
+
+**Consequences:** In a profiled spec build, JFR attributed **104GB** of `int[]` allocation to the `isWhitespace` varargs path alone — roughly half of a **3.1GB/s** allocation storm. About **73%** of validation-phase CPU was JSON serialization for cache keys (item 2). The unbuffered writer (item 3) accounted for **34GB** of `HeapCharBuffer` allocation. None of this work produces different results; it is pure overhead on the hottest paths of the build.
+
+**Repro:** Record JFR with `jdk.ObjectAllocationSample` and `jdk.ExecutionSample` enabled on any validation-heavy workload (e.g. a spec build); the three sites above dominate the allocation and CPU profiles.
+
+**Status:** Fixed in the author's workspace branch [`perf/tx-thread-safety`](https://github.com/jmandel/org.hl7.fhir.core/tree/perf/tx-thread-safety) (switch-based `isWhitespace`, memoized cache keys, buffered writers).
 
 ---
 
 ## 9. kindling forces a full GC after every validated example
 
-**Where:** kindling `ExampleInspector.java:359` (`Runtime.getRuntime().gc()` at the end of `doValidate`), plus three more unconditional `System.gc()` sites on the build path (`Publisher.java` ~3619, `PageProcessor.clean()`/`clean2()` ~11520/11528).
+**Setup.** During the core spec build, kindling validates every example resource in the specification via `ExampleInspector.doValidate(...)`, called once per example file. The build runs with a large heap (14GB in the measured configuration), so any full collection has to walk a large live set.
 
-**Symptom:** 934 explicit-GC events per build (JFR `jdk.SystemGC`); **272s of stop-the-world pause = 40% of the entire stock build** (683s total, 14GB heap). Each forced full collection walks the whole live heap per example file.
+**The bug.** `doValidate` ends with an unconditional explicit GC, so the JVM performs a forced full stop-the-world collection after every single example validated:
 
-**Repro:** JFR on a stock build; or run with `-XX:+DisableExplicitGC` → 683s → 379s with zero code change.
+https://github.com/HL7/kindling/blob/b6cb1f66e49ac8ef4ace2932ad5345cb3e5624d8/src/main/java/org/hl7/fhir/tools/publisher/ExampleInspector.java#L353-L360
+```java
+        warningCount++;
+      else if (m.getLevel() == IssueSeverity.INFORMATION)
+        informationCount++;
+      else
+        errorCount++;
+    }
+    Runtime.getRuntime().gc();
+  }
+```
 
-**Status:** Fixed in `perf/integrated` commit 1.
+Three more unconditional `System.gc()` sites sit on the build path: [`Publisher.java#L3619`](https://github.com/HL7/kindling/blob/b6cb1f66e49ac8ef4ace2932ad5345cb3e5624d8/src/main/java/org/hl7/fhir/tools/publisher/Publisher.java#L3619) and `PageProcessor.clean()`/`clean2()`:
+
+https://github.com/HL7/kindling/blob/b6cb1f66e49ac8ef4ace2932ad5345cb3e5624d8/src/main/java/org/hl7/fhir/tools/publisher/PageProcessor.java#L11523-L11529
+```java
+  public void clean2() {
+    if (definitions.getCodeSystems() != null) 
+      definitions.getCodeSystems().clear();
+    if (definitions.getValuesets() != null) 
+      definitions.getValuesets().clear();
+    System.gc();
+  }
+```
+(`clean()`'s `System.gc()` is at [`PageProcessor.java#L11520`](https://github.com/HL7/kindling/blob/b6cb1f66e49ac8ef4ace2932ad5345cb3e5624d8/src/main/java/org/hl7/fhir/tools/publisher/PageProcessor.java#L11520).)
+
+**Consequences.** JFR shows **934 explicit-GC events per build** (`jdk.SystemGC`), totaling **272s of stop-the-world pause — 40% of the entire stock build** (683s total, 14GB heap). Each forced full collection walks the whole live heap, once per example file.
+
+**Repro.** Run JFR on a stock build and count `jdk.SystemGC` events; or simply run the build with `-XX:+DisableExplicitGC`: 683s → 379s with zero code change.
+
+**Status.** Fixed in the author's workspace branch [`perf/integrated`](https://github.com/jmandel/kindling/tree/perf/integrated) (commit 1).
 
 ---
 
 ## 10. Terminology cache keyed to the alphabetically-first local git branch, not the checked-out branch
 
-**Where:** kindling `Publisher.checkGit` (~lines 634-641): iterates `git.branchList().call()` and takes the **first ref** as `ghBranch` → flows into the tx-cache directory (`~/.fhir/tx-cache/{org}/{repo}/{branch}`) and CI cache-zip URL.
+**Setup.** When kindling builds the spec from a local GitHub clone (i.e., outside CI), `Publisher.checkGit` inspects the repository to derive an org/repo/branch triple. That triple selects the persistent terminology cache directory (`~/.fhir/tx-cache/{org}/{repo}/{branch}`) and the URL of the CI cache-bootstrap zip downloaded from tx.fhir.org.
 
-**Symptom:** Observed live: building `master` while the cache read/wrote `.../integrate-FHIR-11050-empty-2/`. Consequences: caches silently shared/mixed across branches; creating a new branch that sorts first makes every build cold; the CI bootstrap zip URL is wrong.
+**The bug.** `checkGit` never asks which branch is checked out. It iterates `git.branchList().call()` — JGit returns local branch refs in alphabetical order — and returns out of the loop on the **first ref**, so `ghBranch` (and `ciDir`, copied from it) is the alphabetically-first local branch name:
 
-**Repro:** In a checkout with any local branch alphabetically before the current one, run a build and read the "Load Terminology Cache from ..." log line.
+https://github.com/HL7/kindling/blob/b6cb1f66e49ac8ef4ace2932ad5345cb3e5624d8/src/main/java/org/hl7/fhir/tools/publisher/Publisher.java#L634-L641
+```java
+            List<Ref> branches = git.branchList().call();
+            for (Ref ref : branches) {
+              page.getFolders().ghBranch = ref.getName().substring(ref.getName().lastIndexOf("/") + 1, ref.getName().length());
+              // We won't have an explicit CI dir, so set this to ghBranch
+              page.getFolders().ciDir = page.getFolders().ghBranch;
+              System.out.println("This is a GitHub Repository: https://github.com/"+page.getFolders().ghOrg+"/"+page.getFolders().ghRepo+"/"+page.getFolders().ghBranch);
+              return;
+            }          
+```
 
-**Status:** Fixed in `perf/integrated` commit 5 (uses `getFullBranch()`; detached HEAD falls back).
+That value flows via [`PageProcessor` (kindling, L10355-L10356)](https://github.com/HL7/kindling/blob/b6cb1f66e49ac8ef4ace2932ad5345cb3e5624d8/src/main/java/org/hl7/fhir/tools/publisher/PageProcessor.java#L10355-L10356) into fhir-core's `TerminologyCacheManager`, which uses it both for the on-disk cache directory and for the bootstrap zip URL (`https://tx.fhir.org/tx-cache/{org}/{repo}/{branch}.zip`, [L66-L69](https://github.com/hapifhir/org.hl7.fhir.core/blob/5c4d5a0ff3b66f26f1365bc8a3e32ad5c561a6f7/org.hl7.fhir.r5/src/main/java/org/hl7/fhir/r5/terminologies/TerminologyCacheManager.java#L66-L69)):
+
+https://github.com/hapifhir/org.hl7.fhir.core/blob/5c4d5a0ff3b66f26f1365bc8a3e32ad5c561a6f7/org.hl7.fhir.r5/src/main/java/org/hl7/fhir/r5/terminologies/TerminologyCacheManager.java#L54-L58
+```java
+    if (Utilities.noString(ghOrg) || Utilities.noString(ghRepo) || Utilities.noString(ghBranch)) {
+      cacheFolder = Utilities.path(rootDir, "temp", "tx-cache");
+    } else {
+      cacheFolder = Utilities.path(System.getProperty("user.home"), ".fhir", "tx-cache", ghOrg, ghRepo, ghBranch);
+    }
+```
+
+**Consequences.** Observed live: building `master` while the cache read/wrote `.../integrate-FHIR-11050-empty-2/`. Caches are silently shared and mixed across branches; creating a new local branch that sorts first makes every build cold; and the CI bootstrap zip URL is wrong (it names a branch that may not exist on tx.fhir.org).
+
+**Repro.** In a checkout that has any local branch sorting alphabetically before the checked-out one, run a build and read the `Load Terminology Cache from ...` log line ([PageProcessor L10356](https://github.com/HL7/kindling/blob/b6cb1f66e49ac8ef4ace2932ad5345cb3e5624d8/src/main/java/org/hl7/fhir/tools/publisher/PageProcessor.java#L10356)) — the path ends in the wrong branch name.
+
+**Status.** Fixed in the author's workspace branch [`perf/integrated`](https://github.com/jmandel/kindling/tree/perf/integrated) (kindling fork), commit 5: uses `getFullBranch()` for the checked-out branch, with a fallback for detached HEAD.
 
 ---
 
 ## 11. kindling's local terminology short-circuits are bypassed by the validation paths that need them
 
-**Where:** kindling `BuildWorkerContext` (lines 360-384) overrides the 5-arg `validateCode(options, system, version, code, display)` with local handling for SNOMED/LOINC/UCUM/example.org (`loadUcum` at 421, `getUcumService` at 645). But the binding-driven paths that dominate example validation call the `Coding`/`CodeableConcept` overloads (`InstanceValidator.checkCodeOnServer`, fhir-core master 8972-9018), which kindling does not override — they go straight to `BaseWorkerContext` and the network. The 5-arg overload is only reachable from the validator via `InstanceValidator.checkCode` (master 1239, called from `checkTerminologyCoding` ~2082 and `checkCodedElement` ~2445), and that path is pre-gated by `getTxSupportInfo`, which classifies `example.org`/`acme.com` systems as unsupported up front (BaseWorkerContext 829) — so for exactly the systems the override special-cases, it is unreachable from validation. The local UcumService is consulted only by the FHIRPath engine and by that same hard-to-reach override — not by the binding validations that produce the UCUM traffic.
+**Setup.** kindling's `BuildWorkerContext` extends fhir-core's `BaseWorkerContext` and adds local short-circuits for terminology the spec build hits constantly: it overrides the 5-arg `validateCode(options, system, version, code, display)` to answer SNOMED, LOINC, UCUM, and `http://example.org` codes locally (UCUM via a local `UcumEssenceService`), so those lookups never need to reach tx.fhir.org.
 
-**Symptom:** 150 UCUM and dozens of example.org validations per cold build go to the network past a local safety net that was built for them.
+**The bug.** The override covers only one overload — and the validator paths that generate the traffic never call it.
 
-**Repro:** Breakpoint/log the 5-arg overload during a build: in our builds it never fired for example validation (all observed traffic flowed through the Coding/CodeableConcept overloads).
+https://github.com/HL7/kindling/blob/b6cb1f66e49ac8ef4ace2932ad5345cb3e5624d8/src/main/java/org/hl7/fhir/tools/publisher/BuildWorkerContext.java#L360-L371
 
-**Status:** Superseded by `spike/core-localfirst` (proper plug-in at the `ValueSetValidator.findSpecialCodeSystem` level); the effectively-dead override is worth removing or re-wiring upstream either way.
+```java
+  public ValidationResult validateCode(ValidationOptions options, String system, String version, String code, String display) {
+    try {
+      if (system.equals("http://snomed.info/sct"))
+        return verifySnomed(code, display);
+    } catch (Exception e) {
+      return new ValidationResult(IssueSeverity.WARNING, "Error validating snomed code \""+code+"\": "+e.getMessage(), null);
+    }
+    try {
+      if (system.equals("http://loinc.org"))
+        return verifyLoinc(code, display);
+      if (system.equals("http://unitsofmeasure.org"))
+        return verifyUcum(code, display);
+```
+
+(The same method short-circuits `http://example.org` at [L376–L377](https://github.com/HL7/kindling/blob/b6cb1f66e49ac8ef4ace2932ad5345cb3e5624d8/src/main/java/org/hl7/fhir/tools/publisher/BuildWorkerContext.java#L376-L377) before falling through to `super.validateCode` at [L384](https://github.com/HL7/kindling/blob/b6cb1f66e49ac8ef4ace2932ad5345cb3e5624d8/src/main/java/org/hl7/fhir/tools/publisher/BuildWorkerContext.java#L384).)
+
+But the binding-driven checks that dominate example validation go through the `Coding`/`CodeableConcept` overloads of `InstanceValidator.checkCodeOnServer` ([InstanceValidator.java L8972–L9022](https://github.com/hapifhir/org.hl7.fhir.core/blob/5c4d5a0ff3b66f26f1365bc8a3e32ad5c561a6f7/org.hl7.fhir.validation/src/main/java/org/hl7/fhir/validation/instance/InstanceValidator.java#L8972-L9022)), which call the `Coding`/`CodeableConcept` forms of `context.validateCode` — overloads kindling does not override, so they go straight to `BaseWorkerContext` and the network.
+
+The only validator route into the 5-arg overload is `InstanceValidator.checkCode` ([L1239–L1247](https://github.com/hapifhir/org.hl7.fhir.core/blob/5c4d5a0ff3b66f26f1365bc8a3e32ad5c561a6f7/org.hl7.fhir.validation/src/main/java/org/hl7/fhir/validation/instance/InstanceValidator.java#L1239-L1247), reached from `checkTerminologyCoding` at [L2082](https://github.com/hapifhir/org.hl7.fhir.core/blob/5c4d5a0ff3b66f26f1365bc8a3e32ad5c561a6f7/org.hl7.fhir.validation/src/main/java/org/hl7/fhir/validation/instance/InstanceValidator.java#L2082) and `checkCodedElement` at [L2445](https://github.com/hapifhir/org.hl7.fhir.core/blob/5c4d5a0ff3b66f26f1365bc8a3e32ad5c561a6f7/org.hl7.fhir.validation/src/main/java/org/hl7/fhir/validation/instance/InstanceValidator.java#L2445)). That route is pre-gated by `getTxSupportInfo`, which classifies `example.org`/`acme.com` systems as unsupported up front:
+
+https://github.com/hapifhir/org.hl7.fhir.core/blob/5c4d5a0ff3b66f26f1365bc8a3e32ad5c561a6f7/org.hl7.fhir.r5/src/main/java/org/hl7/fhir/r5/context/BaseWorkerContext.java#L829-L831
+
+```java
+        if (system.startsWith("http://example.org") || system.startsWith("http://acme.com") || system.startsWith("http://hl7.org/fhir/valueset-")) {
+          return new SystemSupportInformation(false);
+        } else {
+```
+
+So for exactly the systems the override special-cases, it is unreachable from validation. The local `UcumService` ([loadUcum L421](https://github.com/HL7/kindling/blob/b6cb1f66e49ac8ef4ace2932ad5345cb3e5624d8/src/main/java/org/hl7/fhir/tools/publisher/BuildWorkerContext.java#L421-L423), [getUcumService L645](https://github.com/HL7/kindling/blob/b6cb1f66e49ac8ef4ace2932ad5345cb3e5624d8/src/main/java/org/hl7/fhir/tools/publisher/BuildWorkerContext.java#L645-L647)) is consulted only by the FHIRPath engine and by that same hard-to-reach override — not by the binding validations that produce the UCUM traffic.
+
+**Consequences.** 150 UCUM and dozens of example.org validations per cold build go to the network, past a local safety net that was built for them.
+
+**Repro.** Set a breakpoint (or add logging) on the 5-arg `validateCode` overload in `BuildWorkerContext` during a spec build: in our builds it never fired for example validation — all observed traffic flowed through the `Coding`/`CodeableConcept` overloads.
+
+**Status.** Superseded by the author's workspace branch `spike/core-localfirst` (fhir-core), which plugs in properly at the `ValueSetValidator.findSpecialCodeSystem` level. Either way, the effectively-dead override is worth removing or re-wiring upstream.
 
 ---
 
 ## 12. The spec build is not deterministic (same inputs → different published bytes)
 
-**Where:** Multiple, all upstream of our changes (reproduced on stock builds):
-- **ShEx generation** emits different content between identical runs — whole `EXTENDS @<BackboneElement>` blocks appear/disappear (~78 `.shex` + their `.html` renderings differ per run). Likely unordered-set iteration in the ShEx generator (fhir-core r5 `ShExGenerator`, which uses HashSet/HashMap-backed collections throughout). TTL/JSON-LD show the same class.
-- **Section numbers** for value-set/code-system pages shuffle between runs (HashMap-order dependent numbering in kindling page generation).
-- **Random UUIDs** are embedded in generated table scripts (`// 6fbd5028-...`) and image filenames.
-- **First build in a fresh checkout differs from converged builds** (e.g. `structuredefinition-category` extensions appear only from run 2) — the build reads state produced by prior builds.
+**Setup:** A spec build (kindling driving fhir-core generators) should be a pure function of its inputs: building the same commit twice should publish byte-identical output (after normalizing timestamps). It doesn't — several independent sources of nondeterminism are baked into stock upstream code.
 
-**Repro:** Two consecutive `-nopartial` builds of the same commit; diff publish dirs with timestamps normalized → ~226 files differ (manifest tooling in this workspace automates it: `runs/manifest.py`, `runs/noise-files-v2.txt`).
+**The bug:** Four distinct sources, all upstream of our changes (reproduced on stock builds):
 
-**Status:** Report-only. Matters for caching, signing, and anyone diffing published output.
+1. **Section numbers shuffle (kindling).** Value-set pages get sequential section numbers assigned in the iteration order of a plain `HashMap`, so numbering depends on hash order rather than anything stable:
+
+https://github.com/HL7/kindling/blob/b6cb1f66e49ac8ef4ace2932ad5345cb3e5624d8/src/main/java/org/hl7/fhir/tools/publisher/Publisher.java#L6849-L6854
+```java
+  private void generateValueSetsPart2() throws Exception {
+
+    for (ValueSet vs : page.getDefinitions().getBoundValueSets().values()) {
+//      page.log(" ...value set: "+vs.getId(), LogMessageType.Process);
+      generateValueSetPart2(vs);
+    }
+```
+
+`getBoundValueSets()` is `new HashMap<String, ValueSet>()` ([Definitions.java#L135](https://github.com/HL7/kindling/blob/b6cb1f66e49ac8ef4ace2932ad5345cb3e5624d8/src/main/java/org/hl7/fhir/definitions/model/Definitions.java#L135)), and each page is numbered from a sequential counter as it is visited ([Publisher.java#L6901](https://github.com/HL7/kindling/blob/b6cb1f66e49ac8ef4ace2932ad5345cb3e5624d8/src/main/java/org/hl7/fhir/tools/publisher/Publisher.java#L6901) calling `vsCounter()`, [Publisher.java#L6919-L6922](https://github.com/HL7/kindling/blob/b6cb1f66e49ac8ef4ace2932ad5345cb3e5624d8/src/main/java/org/hl7/fhir/tools/publisher/Publisher.java#L6919-L6922)). Code-system pages are numbered by the same pattern ([Publisher.java#L6785-L6799](https://github.com/HL7/kindling/blob/b6cb1f66e49ac8ef4ace2932ad5345cb3e5624d8/src/main/java/org/hl7/fhir/tools/publisher/Publisher.java#L6785-L6799)).
+
+2. **Random UUIDs in published bytes (fhir-core).** The hierarchical table generator embeds a fresh per-process UUID into every generated table script (`// 6fbd5028-...`); random UUIDs also appear in image filenames:
+
+https://github.com/hapifhir/org.hl7.fhir.core/blob/5c4d5a0ff3b66f26f1365bc8a3e32ad5c561a6f7/org.hl7.fhir.utilities/src/main/java/org/hl7/fhir/utilities/xhtml/HierarchicalTableGenerator.java#L126-L128
+```java
+  private static final String BACKGROUND_ALT_COLOR = "#F7F7F7";
+  public static boolean ACTIVE_TABLES = false;
+  public static String uuid = UUIDUtilities.makeUuidLC();
+```
+
+The UUID is written into output at [HierarchicalTableGenerator.java#L922-L923](https://github.com/hapifhir/org.hl7.fhir.core/blob/5c4d5a0ff3b66f26f1365bc8a3e32ad5c561a6f7/org.hl7.fhir.utilities/src/main/java/org/hl7/fhir/utilities/xhtml/HierarchicalTableGenerator.java#L922-L923) (`String js= "  // "+uuid+"\n";`). Notably, a `forTesting()` hook already pins it to a constant ([#L1500-L1502](https://github.com/hapifhir/org.hl7.fhir.core/blob/5c4d5a0ff3b66f26f1365bc8a3e32ad5c561a6f7/org.hl7.fhir.utilities/src/main/java/org/hl7/fhir/utilities/xhtml/HierarchicalTableGenerator.java#L1500-L1502)) — an existing acknowledgment that the randomness breaks output comparison.
+
+3. **ShEx generation varies between identical runs (fhir-core).** Whole `EXTENDS @<BackboneElement>` blocks appear/disappear between runs (~78 `.shex` files plus their `.html` renderings differ per run). Likely unordered-set iteration in the ShEx generator — at this SHA the generation logic lives in `ShExGeneratorBase` (r5), which tracks its working state in hash-backed collections (declarations at [ShExGeneratorBase.java#L281-L294](https://github.com/hapifhir/org.hl7.fhir.core/blob/5c4d5a0ff3b66f26f1365bc8a3e32ad5c561a6f7/org.hl7.fhir.r5/src/main/java/org/hl7/fhir/r5/conformance/ShExGeneratorBase.java#L281-L294), e.g. `HashSet<String> uniq_structure_urls`); the `EXTENDS @<...>` text is emitted at [#L640-L649](https://github.com/hapifhir/org.hl7.fhir.core/blob/5c4d5a0ff3b66f26f1365bc8a3e32ad5c561a6f7/org.hl7.fhir.r5/src/main/java/org/hl7/fhir/r5/conformance/ShExGeneratorBase.java#L640-L649). TTL/JSON-LD output shows the same class of run-to-run variance.
+
+4. **Build reads its own prior output.** The first build in a fresh checkout differs from converged builds (e.g. `structuredefinition-category` extensions appear only from run 2 onward) — the build reads state produced by prior builds.
+
+**Consequences:** Two consecutive builds of the same commit publish different bytes: ~226 files differ even after timestamps are normalized. This defeats output caching, undermines signing/attestation of published artifacts, generates spurious diffs for anyone comparing published output across builds, and means a fresh-checkout build is not even self-consistent with a converged one.
+
+**Repro:** Run two consecutive `-nopartial` builds of the same commit; diff the publish directories with timestamps normalized → ~226 files differ. Manifest tooling in this workspace automates the comparison (`runs/manifest.py`, `runs/noise-files-v2.txt` — author's workspace, not upstream).
+
+**Status:** Report-only; no fix branch. Matters for caching, signing, and anyone diffing published output.
 
 ---
 
 ## 13. XML comments grow one space per compose/reparse cycle
 
-**Where:** fhir-core `org.hl7.fhir.utilities.xml.XMLWriter.comment` (line 475, write at 491) emits `"  <!-- " + text + " -->"` (one space of padding *inside* each delimiter); `org.hl7.fhir.r5.elementmodel.XmlParser.reapComments` (lines 693-709) stores the raw node text content (`getTextContent()`) **including that padding**.
+**Setup:** fhir-core's element-model XML pipeline round-trips resources through compose (`org.hl7.fhir.utilities.xml.XMLWriter`) and parse (`org.hl7.fhir.r5.elementmodel.XmlParser`). Comments attached to elements (`Element.getComments()`) are supposed to survive these round trips unchanged; downstream composers (e.g. Turtle) re-emit them verbatim.
 
-**Symptom:** Every compose→parse round trip grows every comment by one leading and one trailing space. Visible in published TTL (`#   <priority value="5" />` vs `#  <priority ...>`) because the Turtle composer emits comments verbatim; it made example outputs depend on how many XML round trips the pipeline happened to take.
+**The bug:** The writer pads the comment text with one space *inside* each delimiter, and the parser reaps the raw DOM text content — padding included — so the two halves of the round trip are asymmetric.
 
-**Repro:** Parse a resource with an XML comment, compose, re-parse, compare `Element.getComments()` strings — they differ by two spaces per cycle.
+https://github.com/hapifhir/org.hl7.fhir.core/blob/5c4d5a0ff3b66f26f1365bc8a3e32ad5c561a6f7/org.hl7.fhir.utilities/src/main/java/org/hl7/fhir/utilities/xml/XMLWriter.java#L488-L491
+```java
+		if (levels.inComment())
+			write("  <!-- "+comment+" -- >");
+		else
+			write("  <!-- "+comment+" -->");
+```
 
-**Status:** Report-only (we made the build's round-trip count deterministic instead; the asymmetry remains upstream).
+`XmlParser.reapComments` then stores `node.getTextContent()`, which for `<!-- text -->` is `" text "` — the padding becomes part of the stored comment string:
+
+https://github.com/hapifhir/org.hl7.fhir.core/blob/5c4d5a0ff3b66f26f1365bc8a3e32ad5c561a6f7/org.hl7.fhir.r5/src/main/java/org/hl7/fhir/r5/elementmodel/XmlParser.java#L693-L699
+```java
+  private void reapComments(org.w3c.dom.Element element, Element context) {
+    Node node = element.getPreviousSibling();
+    while (node != null && node.getNodeType() != Node.ELEMENT_NODE) {
+      if (node.getNodeType() == Node.COMMENT_NODE)
+        context.getComments().add(0, node.getTextContent());
+      node = node.getPreviousSibling();
+    }
+```
+
+(The full method is [XmlParser.java#L693-L709](https://github.com/hapifhir/org.hl7.fhir.core/blob/5c4d5a0ff3b66f26f1365bc8a3e32ad5c561a6f7/org.hl7.fhir.r5/src/main/java/org/hl7/fhir/r5/elementmodel/XmlParser.java#L693-L709); the trailing-comments loop has the same behavior. The write site is inside [`XMLWriter.comment`, #L475-L494](https://github.com/hapifhir/org.hl7.fhir.core/blob/5c4d5a0ff3b66f26f1365bc8a3e32ad5c561a6f7/org.hl7.fhir.utilities/src/main/java/org/hl7/fhir/utilities/xml/XMLWriter.java#L475-L494).)
+
+**Consequences:** Every compose→parse round trip grows every comment by one leading and one trailing space. This is visible in published TTL (`#   <priority value="5" />` vs `#  <priority ...>`) because the Turtle composer emits comments verbatim — example outputs ended up depending on how many XML round trips the pipeline happened to take.
+
+**Repro:** Parse a resource containing an XML comment, compose it, re-parse, and compare the `Element.getComments()` strings — they differ by two spaces per cycle.
+
+**Status:** Report-only. In the author's workspace, the build's round-trip count was made deterministic instead, which hides the symptom locally; the asymmetry itself remains upstream.
 
 ---
 
 ## 14. CI terminology-cache bootstrap 404s for forks
 
-**Where:** fhir-core r5 `TerminologyCacheManager.initialize` (lines 61-72) fetches `https://tx.fhir.org/tx-cache/{org}/{repo}/{branch}.zip`, falling back to `{org}/{repo}/default.zip` (line 72) — the fallback is still fork-scoped. For forks (e.g. `jmandel/fhir`), both URLs 404: a fork's "cold" build is fully cold while the canonical repo's is seeded.
+**Setup.** When a build runs in CI (GitHub org/repo/branch known), fhir-core's r5 `TerminologyCacheManager` tries to seed the local terminology cache by downloading a pre-built cache zip from `tx.fhir.org/tx-cache/`, keyed by the repository coordinates. A seeded cache avoids re-asking the terminology server for answers the canonical build already has.
 
-**Repro:** Build a fork clone with an empty tx-cache; log shows `No - can't initialise cache from .../jmandel/fhir/master.zip: Not Found`.
+**The bug.** Both the primary URL and the fallback URL are scoped to the *current* org/repo. The fallback only retries with `default.zip` in place of the branch name — it never falls back to the canonical upstream repository:
 
-**Fix direction:** fallback chain fork → canonical upstream repo → default.
+https://github.com/hapifhir/org.hl7.fhir.core/blob/5c4d5a0ff3b66f26f1365bc8a3e32ad5c561a6f7/org.hl7.fhir.r5/src/main/java/org/hl7/fhir/r5/terminologies/TerminologyCacheManager.java#L66-L76
+```java
+    if (!version.equals(getCacheVersion())) {
+      clearCache();
+      fillCache("https://tx.fhir.org/tx-cache/"+ghOrg+"/"+ghRepo+"/"+ghBranch+".zip");
+    }
+    if (!version.equals(getCacheVersion())) {
+      clearCache();
+      fillCache("https://tx.fhir.org/tx-cache/"+ghOrg+"/"+ghRepo+"/default.zip");
+    }
+    if (!version.equals(getCacheVersion())) {
+      clearCache();
+    }
+```
 
-**Status:** Report-only (infrastructure/policy more than code).
+For a fork (e.g. `jmandel/fhir`), no cache zip has ever been uploaded under that org/repo, so both URLs 404 and `fillCache` just logs the failure and moves on:
+
+https://github.com/hapifhir/org.hl7.fhir.core/blob/5c4d5a0ff3b66f26f1365bc8a3e32ad5c561a6f7/org.hl7.fhir.r5/src/main/java/org/hl7/fhir/r5/terminologies/TerminologyCacheManager.java#L88-L93
+```java
+      HTTPResult res = ManagedWebAccess.get(Arrays.asList("web"), source+"?nocache=" + System.currentTimeMillis());
+      res.checkThrowException();
+      unzip(new ByteArrayInputStream(res.getContent()), cacheFolder);
+    } catch (Exception e) {
+      log.error("No - can't initialise cache from "+source+": "+e.getMessage(), e);
+    }
+```
+
+**Consequences.** A fork's "cold" CI build is fully cold — every terminology answer is a fresh round trip to the tx server — while the canonical repo's cold build starts from a seeded cache. Contributors testing spec changes on forks see materially slower (and harder-on-tx.fhir.org) builds than the canonical pipeline for the same commit.
+
+**Repro.** Build a fork clone (e.g. `jmandel/fhir`) in CI with an empty tx-cache; the log shows `No - can't initialise cache from .../jmandel/fhir/master.zip: Not Found`, followed by the same for `default.zip`.
+
+**Fix direction.** Extend the fallback chain: fork → canonical upstream repo (e.g. `HL7/fhir`) → default.
+
+**Status.** Report-only — this is as much tx-cache hosting infrastructure/policy as code; no workspace branch carries a fix.
