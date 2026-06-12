@@ -4,9 +4,9 @@ All found while profiling/parallelizing the core FHIR spec build (kindling + org
 
 ---
 
-## 1. cache-id terminology protocol yields wrong validation results for grammar-based code systems
+## 1. The cache-id terminology protocol is broken for grammar-based code systems — and was "fixed" by silently disabling it for every consumer
 
-**Setup.** fhir-core's terminology client supports a `cache-id` protocol: instead of inlining the full ValueSet resource into every `$validate-code` request, the client sends the ValueSet once, then refers to it by `url`/`valueSetVersion` plus a shared `cache-id` on subsequent calls. A static flag, `TerminologyClientContext.canUseCacheId`, gates the whole mechanism ([declaration L74](https://github.com/hapifhir/org.hl7.fhir.core/blob/5c4d5a0ff3b66f26f1365bc8a3e32ad5c561a6f7/org.hl7.fhir.r5/src/main/java/org/hl7/fhir/r5/terminologies/client/TerminologyClientContext.java#L74), [setter L311-L313](https://github.com/hapifhir/org.hl7.fhir.core/blob/5c4d5a0ff3b66f26f1365bc8a3e32ad5c561a6f7/org.hl7.fhir.r5/src/main/java/org/hl7/fhir/r5/terminologies/client/TerminologyClientContext.java#L311-L313)).
+**Setup.** fhir-core's terminology client supports a `cache-id` protocol: instead of inlining the full ValueSet resource into every `$validate-code` request, the client sends the ValueSet once, then refers to it by `url`/`valueSetVersion` plus a shared `cache-id` on subsequent calls. Until September 2024 this engaged automatically whenever the server advertised support (the gate was just `if (txcaps != null)`), so every fhir-core consumer used it. Core commit `3d13e5ae5` (Sept 24 2024, "Allow for code to turn off use of cache-id on tx interface (for debugging)") added a static gate, `TerminologyClientContext.canUseCacheId` ([declaration L74](https://github.com/hapifhir/org.hl7.fhir.core/blob/5c4d5a0ff3b66f26f1365bc8a3e32ad5c561a6f7/org.hl7.fhir.r5/src/main/java/org/hl7/fhir/r5/terminologies/client/TerminologyClientContext.java#L74), [engagement check L218](https://github.com/hapifhir/org.hl7.fhir.core/blob/5c4d5a0ff3b66f26f1365bc8a3e32ad5c561a6f7/org.hl7.fhir.r5/src/main/java/org/hl7/fhir/r5/terminologies/client/TerminologyClientContext.java#L218), [setter L311-L313](https://github.com/hapifhir/org.hl7.fhir.core/blob/5c4d5a0ff3b66f26f1365bc8a3e32ad5c561a6f7/org.hl7.fhir.r5/src/main/java/org/hl7/fhir/r5/terminologies/client/TerminologyClientContext.java#L311-L313)) — **defaulting to `false`, which turned the protocol off for the entire ecosystem in one commit**. No production code anywhere in fhir-core, kindling, or IG Publisher ever sets it to `true`; the only caller of the setter at all is kindling's redundant re-disable.
 
 **The bug.** The inline-vs-by-reference switch lives in `BaseWorkerContext.addServerValidationParameters`. Once a ValueSet has been registered under the cache-id, later validations send only its url, and the server validates against its registered copy:
 
@@ -25,7 +25,7 @@ https://github.com/hapifhir/org.hl7.fhir.core/blob/5c4d5a0ff3b66f26f1365bc8a3e32
 
 When the ValueSet draws on a grammar-based "infinite" code system — e.g. `urn:ietf:bcp:13`, where any syntactically valid mimetype is a member — the by-reference path loses those special-system semantics: the registered ValueSet behaves as an enumerable set with no members, so valid codes are rejected. The defect reproduces identically on the legacy deployed tx.fhir.org and on current FHIRsmith (`tx/` module), so it lies in the interaction design or shared client behavior, not one server build.
 
-kindling works around it by hard-disabling cache-id at the very top of the build, with no recorded rationale (commit 0b65fdc, Sept 24 2024, "No use cache-id on the tx server" — this bug is the probable rationale):
+kindling additionally hard-disables it at the very top of the build — same day as the core off-switch commit, no recorded rationale (commit 0b65fdc, Sept 24 2024, "No use cache-id on the tx server"; this bug is the probable rationale), and redundant given the false default:
 
 https://github.com/HL7/kindling/blob/b6cb1f66e49ac8ef4ace2932ad5345cb3e5624d8/src/main/java/org/hl7/fhir/tools/publisher/Publisher.java#L685-L687
 ```java
@@ -34,11 +34,14 @@ https://github.com/HL7/kindling/blob/b6cb1f66e49ac8ef4ace2932ad5345cb3e5624d8/sr
     tester = new PublisherTestSuites();
 ```
 
-**Consequences.** With cache-id enabled, validations against grammar-based systems return false negatives: `The value provided ('application/pdf') was not found in the value set 'Mime Types'`, same for `image/jpeg`, `application/dicom`, valid BCP-47 codes, etc. A full spec build went from Errors=0 to **Errors=285**, and Warnings shifted 3693→3821. Meanwhile every build that keeps the flag off pays the cost of inlining full ValueSets on every request.
+**Consequences.** Three distinct harms, in sequence:
+1. **Until Sept 2024 this was an active wrong-results bug** for every consumer validating against grammar-based systems through a cache-id-capable server: false negatives like `The value provided ('application/pdf') was not found in the value set 'Mime Types'`, same for `image/jpeg`, `application/dicom`, valid BCP-47 codes, etc. Re-enabling it today takes a full spec build from Errors=0 to **Errors=285** (Warnings 3693→3821).
+2. **The mitigation neutered a real optimization for everyone**: with the flag off (the universal state today), every request re-inlines its full ValueSet — a meaningful share of the request-serialization cost documented in bug 8 — and the protocol code is effectively dead.
+3. **The defect is a latent landmine**: the protocol bug itself was never fixed (it reproduces on both the legacy deployed tx.fhir.org and current FHIRsmith, so it lies in the interaction design or shared client behavior, not one server build), the off-switch is an undocumented public static one call away from re-arming it, and neither the disable commit nor the code records *why* it is off — this report is that missing documentation.
 
 **Repro.** Remove the `setCanUseCacheId(false)` line in `Publisher.execute` (or use the `-Dfhir.build.tx.usecacheid=true` gate on the author's workspace branch `spike/s9-tx-cold`) and run any spec build; `binary-example` fails on `Binary.contentType` immediately. Minimal repro: register the mimetypes ValueSet via cache-id, then `$validate-code` `application/pdf` against it by reference. (VERIFICATION NEEDED: a raw-HTTP emulation of that two-request sequence against tx.fhir.org/r5 — inline `valueSet` + `cache-id`, then `url`+`valueSetVersion` with the same `cache-id` — was not retained by the server at all ("value set could not be found"), so the minimal repro may need the real client's full cache-id handshake; the build-level repro is the verified one.)
 
-**Status.** Report-only; no fix branch. The kindling flag remains off. The `spike/s9-tx-cold` branch mentioned above is one of the author's local workspace branches, not upstream.
+**Status.** Report-only; no fix branch — the protocol defect needs an upstream design decision (fix the by-reference semantics for grammar-based systems, or document and remove the dead protocol). The kindling flag remains off, and the global default remains `false`. The `spike/s9-tx-cold` branch mentioned above is one of the author's local workspace branches, not upstream.
 
 ---
 
