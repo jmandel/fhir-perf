@@ -222,3 +222,25 @@ track (runs on [parity] tag/dispatch), where double-build evidence + O-tier (ord
 second-chance hashing, tamper-verified) keep noise excusal honest without allowlist blindness.
 Pack-vs-live equivalence is established once at recording time and inherited transitively.
 Manifest tooling: parallelized 74s -> 14s (Python 3.14 non-fork multiprocessing gotcha), opt-in.
+
+## All-Java future world + bug 15 (June 13)
+
+The demo's scaffolding became product: core txpack/chain gained TerminologyCachePackager
+`diff` (canonical pack comparison, 63/0/0 parity with the python tool on real packs) and
+TxLock (content-addressed pack resolution with sha256 verify, ~/.fhir/tx-packs store);
+kindling perf/integrated gained OutputManifest (manifest/compare/impact, identical path sets
+to python on 26,865 files, parallel) and SpecBuild - one CLI front door (build/judge/impact/
+manifest/compare/diff-packs) that pins locale/timezone IN-PROCESS, resolves tx.lock natively,
+asserts the lock's signature, and accumulates local evidence manifests. python deleted from
+the demo branch; bash reduced to a 20-line jar bootstrap; dependency footprint = JDK.
+Local E2E: `SpecBuild build . --judge` = 190s, hermetic, exact signature, evidence-excused
+parity, rc=0. CI gate green from a COLD runner (pack fetched by the publisher itself).
+
+That cold fetch found **bug 15**: SimpleHTTPClient percent-decodes redirect Location headers
+(stock master L96, introduced a4efdb922 May 2024), corrupting signed-URL redirects - GitHub
+release assets 400 every time through ManagedWebAccess while curl succeeds. Fixed on
+txpack/chain (80c9dfe13); added to the upstream report (P2).
+
+Refresh-flow E2E status: no-change path validated (silent stop); harmful-candidate path
+validated twice in CI (downgrade blocked, +27-warnings/Errors=1 signatures); benign-change
+path (layered PR incl. GitHub Models explanation) pending a benign candidate.
