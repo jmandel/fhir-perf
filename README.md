@@ -10,7 +10,7 @@ Performance and correctness work on the core FHIR specification build
 - **Cold build: 1117s stock → 195s** with an immutable terminology answer pack — cold ≡ warm.
 - **Hermetic ("airplane") build proven**: full cold build, **zero network requests**, 231s,
   byte-identical output to the reference (Errors=0 / Warnings=3693 / Info=345).
-- 14 upstream bugs found, verified against stock code, documented with repros.
+- 15 upstream bugs found, verified against stock code, documented with repros.
 
 ### Documents
 
@@ -18,7 +18,7 @@ Performance and correctness work on the core FHIR specification build
 |---|---|
 | [docs/txpack-vision.md](docs/txpack-vision.md) | **The settled vision**: moving parts, user experiences, single-writer trust model |
 | [docs/txpack-proposal.md](docs/txpack-proposal.md) | Design proposal: immutable, content-addressed terminology answer packs (`tx.lock`) replacing the mutable per-machine cache and the un-gated zip publish pipeline |
-| [docs/upstream-bugs.md](docs/upstream-bugs.md) | Consolidated bug report — 14 bugs, each with verified cause location and repro |
+| [docs/upstream-bugs.md](docs/upstream-bugs.md) | Consolidated bug report — 15 bugs, each with verified cause location and repro |
 | [docs/upstream-plan.md](docs/upstream-plan.md) | PR sequencing plan: what goes upstream, in what order, stacked vs parallel, with branch links |
 | [docs/perf-findings.md](docs/perf-findings.md) | Full measurement log and root-cause analysis |
 | [docs/cold-start-moonshots.md](docs/cold-start-moonshots.md) | Idea inventory for cold-start work (incl. negative results) |
