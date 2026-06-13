@@ -18,16 +18,21 @@ with the checkout, not from a server's mood.
 | Part | What it is | Who touches it |
 |---|---|---|
 | **Answer pack** | Immutable, content-addressed zip of recorded server answers (validations incl. negatives, expansions incl. deterministic refusals, capabilities, registry map). Poison (transport errors) structurally unrepresentable. ~2.3MB for the whole spec. | Created only by the recorder; stored in a release/artifact store; never in git |
-| **`tx.lock`** | ~1KB file in the repo: pack hash + URL, expected output signature. The repo *names* which answers this commit builds against. | **Single writer: the refresh bot.** Editors never touch it — no merge conflicts, ever |
+| **`fhir.lock`** | The content lock, an npm package-lock v3 *profile* (packages map of name → {version, resolved, integrity}; no vendor folder — entries resolve into the shared verify-on-use store). The txpack is the first entry; ordinary FHIR packages can join with the same mechanism. Carries expectedOutput (it changes in the same commit as the pack). | **Single writer: the refresh bot.** Editors never touch it — no merge conflicts, ever |
 | **Seed layer** | The build consults the pack before anything else; **misses fall through to the network gracefully**. A stale pack degrades to today's behavior, never to an error. | Inside the toolchain (fhir-core), property-driven |
 | **Recorder / refresh bot** | Scheduled job: full live build with recording on (shadow recording makes it exhaustive), gated on rc=0 + output parity vs its own previous run. Packages; if the canonical hash is unchanged — stop silently (a free daily drift check). On change: upload the new pack, open a lock-bump PR. | Automation; the only producer of packs and lock changes |
 | **Hermetic mode** | Opt-in switch making any terminology network attempt a loud failure naming the request. The completeness proof and diagnostic instrument — not the everyday mode. | Refresh/verification jobs; anyone proving "airplane build" |
 | **Output manifest / judge** | Normalized fingerprints of published output; compares builds while excusing the stock toolchain's *documented* nondeterminism with per-file evidence (order-insensitive second-chance hashing; same-run double-build evidence). | Verification tooling; never required for an ordinary build |
 
 All behavior lives in the shared Java toolchain (fhir-core + kindling), property-gated and
-default-off; the same seam serves IG Publisher later. **Dependency footprint of every flow
-below: a JDK.** (No python, no bash — the prototype's scripts are scaffolding being replaced
-by the toolchain reading `tx.lock` natively and by Java CLIs for the verification tools.)
+default-off; the same seam serves IG Publisher later. **Dependency footprint of every flow:
+a JDK** — a committed 4KB launcher jar (gradle-wrapper pattern) bootstraps the pinned tooling
+(`kindling-wrapper.properties`: url + sha256, human-written), which reads `fhir.lock` natively;
+verification tools are Java CLIs in the same jar. Trust layering in one line: registries FIND
+bytes, the lock TRUSTS bytes (verified on every use), the content-addressed store KEEPS bytes.
+Distribution rides existing rails: packs as npm-format FHIR packages (precedent: the
+expansions package), tooling on Maven — with integrity always from the lock, never assumed
+from the registry or cache.
 
 ## The user experiences
 
