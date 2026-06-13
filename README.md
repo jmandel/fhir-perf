@@ -16,6 +16,7 @@ Performance and correctness work on the core FHIR specification build
 
 | Doc | What |
 |---|---|
+| [docs/txpack-vision.md](docs/txpack-vision.md) | **The settled vision**: moving parts, user experiences, single-writer trust model |
 | [docs/txpack-proposal.md](docs/txpack-proposal.md) | Design proposal: immutable, content-addressed terminology answer packs (`tx.lock`) replacing the mutable per-machine cache and the un-gated zip publish pipeline |
 | [docs/upstream-bugs.md](docs/upstream-bugs.md) | Consolidated bug report — 14 bugs, each with verified cause location and repro |
 | [docs/upstream-plan.md](docs/upstream-plan.md) | PR sequencing plan: what goes upstream, in what order, stacked vs parallel, with branch links |
