@@ -677,3 +677,39 @@ https://github.com/HL7/kindling/blob/b6cb1f66e49ac8ef4ace2932ad5345cb3e5624d8/sr
 **Repro.** In `Publisher.execute`, change the existing `TerminologyClientContext.setCanUseCacheId(false)` call to `true` — merely removing the line is not enough, since the core default is already `false` — and run any spec build (equivalently, build the author's kindling branch [`perf/integrated`](https://github.com/jmandel/kindling/tree/perf/integrated) with the optional `-Dfhir.build.tx.usecacheid=true` gate it adds); `binary-example` fails on `Binary.contentType` immediately. Minimal repro: register the mimetypes ValueSet via cache-id, then `$validate-code` `application/pdf` against it by reference. (VERIFICATION NEEDED: a raw-HTTP emulation of that two-request sequence against tx.fhir.org/r5 — inline `valueSet` + `cache-id`, then `url`+`valueSetVersion` with the same `cache-id` — was not retained by the server at all ("value set could not be found"), so the minimal repro may need the real client's full cache-id handshake; the build-level repro is the verified one.)
 
 **Status / recommendation.** Report-only; no fix branch. The state to resolve is "unused and unsafe": nothing has exercised this code path since Sept 2024, and the only thing standing between the ecosystem and Errors=285 is an undocumented `false` default on a public static. Two clean exits, either of which is better than the status quo: **(a) cut it** — remove the protocol client-side and reclaim the dead code, or **(b) make it safe** — fix the by-reference semantics for grammar-based systems server-side, add a regression test that validates `application/pdf` through a cache-id round trip, and only then re-enable. Until one of those happens, at minimum the default deserves a comment saying *why* it is off. The `perf/integrated` branch mentioned above is on the author's fork, not upstream.
+
+---
+
+## 15. `SimpleHTTPClient` percent-decodes redirect Location headers, breaking signed-URL redirects (GitHub releases, S3/Azure presigned)
+
+**Setup.** fhir-core's `SimpleHTTPClient` (the engine under `ManagedWebAccess`, the library's
+documented network choke point) follows HTTP redirects itself
+(`setInstanceFollowRedirects(false)` plus a manual loop).
+
+**The bug.** The loop URL-decodes the `Location` header before following it:
+
+https://github.com/hapifhir/org.hl7.fhir.core/blob/5c4d5a0ff3b66f26f1365bc8a3e32ad5c561a6f7/org.hl7.fhir.utilities/src/main/java/org/hl7/fhir/utilities/http/SimpleHTTPClient.java#L96
+```java
+          location = URLDecoder.decode(location, StandardCharsets.UTF_8);
+```
+
+A `Location` header is already a URL and must be used as-is. Decoding corrupts any redirect
+target whose query string carries percent-encoded data — most importantly **signed URLs**:
+GitHub release-asset downloads redirect to S3 URLs whose AWS SigV4 parameters contain `%2F`
+etc.; decoding them invalidates the signature and the storage backend answers 400 Bad Request.
+(It can also corrupt redirect targets with literal `+` or `%` path/query characters.)
+Introduced in `a4efdb922` ("introduce ManagedWebAccess", May 2024).
+
+**Consequences.** Any fhir-core download whose server redirects to a signed URL fails with a
+misleading `Invalid HTTP response 400 ... Bad Request` naming the *original* URL. Observed
+live: fetching a GitHub release asset through `ManagedWebAccess.get` fails 100% of the time
+while `curl -L` on the same URL succeeds.
+
+**Repro.** `ManagedWebAccess.get(Utilities.strings("web"), "https://github.com/<any>/releases/download/<tag>/<asset>")`
+→ HTTPResultException 400. Remove the decode line → succeeds.
+
+**Status.** Fixed in the author's workspace branch
+[`txpack/chain`](https://github.com/jmandel/org.hl7.fhir.core/tree/txpack/chain) (commit
+80c9dfe13: use the header as-is, comment explaining why). One-line fix; a unit test with a
+redirect whose Location contains `%2F` in the query would pin it.
+
