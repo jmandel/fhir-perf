@@ -270,3 +270,41 @@ fix, the narrowed TTL survivor of bug #7 source 3) + wall-clock timestamps (vers
 normalizer territory) + downstream containers. For PARALLEL byte-repro the known search-param
 validation race also applies (serial sidesteps it). Net: converged serial build now reproducible
 run-to-run except fhir.ttl + timestamps. All folded into upstream-bugs.md bug #7 status.
+
+## Correctness sweep of the perf forks (June 14)
+
+Triggered by the realization that the "search-param race" was filed as a runbook note
+(threads=1) rather than a correctness defect, and that the determinism pass had just found a
+real shared-mutation bug (ValueSetExpander) the static review missed. Three complementary
+efforts:
+
+1. **Empirical reproduction** — 4 parallel builds: all clean (exact 0/3693/345). The
+   result-flipping event (one build hit Errors=2 earlier) is rare (≲1-in-10) and unreproduced.
+2. **Concurrency audit** (6-agent workflow) over every parallel path we introduced
+   (validateFiles, searchparams, prefetchExpansions, overlapValidation, packagingTail, core
+   WorkerContext): **no confirmed result-flipping/corrupting race.** The search-param path is
+   provably clean (`certain`) — per-thread FHIRPathEngine, synchronized expressionNode cache,
+   monotonic-post-join flags, evaluate() doesn't mutate the node; the earlier race was already
+   closed by the expressionNode synchronization. Only residual: a benign diagnostic txLink
+   provenance race in prefetch (server-fallback only, not expansion content; never fires in
+   pack/hermetic mode). The CME-on-shared-SD-userData race is handled by the existing
+   warmup+serial-retry fallback.
+3. **Behavior-preservation review** (9-agent workflow) of the foundational perf optimizations
+   never put through rigorous review (kindling 520b280/79b56dd/bb3cc94/455888a/99e0504/3556ad7;
+   core a4030ee0a/b56b1e818/3116a459c): **all behavior-preserving for valid builds.** The HashMap
+   indexes equal the linear scans they replace (verified ValueSet has no equals/hashCode override
+   so identity-keying is exact), the single-pass token engine and serialization-reduction preserve
+   output, cache-key memoization doesn't collide/stale, parser precomputed-sets match. One
+   intentional documented delta: a4030ee0a downgrades ConceptMapValidator NOSERVICE error→warning
+   (no-terminology-server runs only; the spike-A fix turning silent corruption into visible
+   degradation). One latent trap hardened: clean2() now invalidates VS-derived caches it left
+   stale (f449fb9). One item covered by empirical signal: 79b56dd's book-template→real-page
+   fragment-scan change is unverifiable by publish-dir parity (fragments don't reach publish), but
+   the QA warning count held at 3693 across dozens of builds, so the validated fragment set is
+   stable.
+
+Net: no live correctness regression in the perf forks beyond what was already fixed/handled;
+two minor items (benign txLink, latent clean2 — now hardened). Process lesson recorded: static
+review + output-parity sampling missed two runtime/shared-state bugs (ValueSetExpander mutation,
+and the rare validation event); concurrency and shared-mutation need their own targeted passes,
+done here.
