@@ -244,3 +244,29 @@ txpack/chain (80c9dfe13); added to the upstream report (P2).
 Refresh-flow E2E status: no-change path validated (silent stop); harmful-candidate path
 validated twice in CI (downgrade blocked, +27-warnings/Errors=1 signatures); benign-change
 path (layered PR incl. GitHub Models explanation) pending a benign candidate.
+
+## Determinism fixes in the forks (June 14)
+
+Driven by a same-machine run-to-run diff (two converged SERIAL builds, race-free, both
+0/3693/345). Genuine run-to-run nondeterministic files: **21 → effectively 1**. Characterized
+via a 6-agent workflow (runs/ + transcripts); fixes applied to core txpack/chain + kindling
+perf/integrated, 119 core unit tests green, output signature unchanged:
+
+- core CanonicalResourceManager.allResources HashSet→LinkedHashSet — identity-hash iteration
+  order reordered every getList() consumer (warnings.xml messages, toc.html section numbers,
+  spec.internals targets). Root fix; spec.internals now timestamp-only, toc stable.
+- core ValueSetExpander.addCode defensive-copy — was appending the synthetic preferredForLanguage
+  designation to the caller's LIVE cached CodeSystem list → duplicate accumulation flickering with
+  processing order (expansions.json + the value-set display-column present/empty flicker). Real
+  shared-state-mutation correctness bug, not just nondeterminism. Fixed the displayflicker at root
+  (no renderer mask needed).
+- core PatientRenderer photo filename: per-build random UUID → content-derived CRC32 name.
+- kindling: NamingSystem registry bundle sort-by-fullUrl; scanForPages/scanForImages sort
+  listFiles by name (also the cross-machine fs-enumeration class).
+
+Remaining run-to-run residual: fhir.ttl (OWL ontology RDF ordering — ~25 subjects via a
+secondary unsorted pass + intra-subject restriction/predicate order; deeper FhirTurtleGenerator
+fix, the narrowed TTL survivor of bug #7 source 3) + wall-clock timestamps (version.info etc.,
+normalizer territory) + downstream containers. For PARALLEL byte-repro the known search-param
+validation race also applies (serial sidesteps it). Net: converged serial build now reproducible
+run-to-run except fhir.ttl + timestamps. All folded into upstream-bugs.md bug #7 status.
